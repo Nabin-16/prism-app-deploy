@@ -1,0 +1,40 @@
+name: Sync PRISM results from Supabase
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # hourly; tune to taste
+  workflow_dispatch: {}     # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch results from Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/fetch_supabase_results.py
+
+      - name: Commit snapshot if it changed
+        run: |
+          git config user.name "prism-bot"
+          git config user.email "prism-bot@users.noreply.github.com"
+          git add results/cloud
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "chore: sync results from Supabase [skip ci]"
+            git push
+          fi
