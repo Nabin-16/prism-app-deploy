@@ -114,16 +114,33 @@ def ollama_auto_install_supported() -> bool:
     return ollama_installer.is_platform_supported()
 
 
+def normalize_tag(tag: str) -> str:
+    """Treat a bare tag (``"qwen2.5"``) and its explicit ``:latest`` form
+    (``"qwen2.5:latest"``) as the same model - Ollama's own listing is
+    inconsistent about which form it reports. This must NOT collapse two
+    *different* explicit tags of the same base name (``"qwen2.5:0.5b"``
+    vs ``"qwen2.5:3b"`` are different weights on disk, not the same
+    model) - only the missing-tag case is ambiguous, an explicit
+    non-"latest" tag never is.
+    """
+    return tag if ":" in tag else f"{tag}:latest"
+
+
 def installed_model_tags() -> set[str]:
     try:
         names = {m.name for m in ollama.list_models()}
     except ollama.OllamaError:
         return set()
-    # tolerate an implicit ":latest"
-    expanded = set(names)
-    for n in names:
-        expanded.add(n.split(":")[0])
-    return expanded
+    # Normalize every installed name so a bare "qwen2.5" and an explicit
+    # "qwen2.5:latest" from Ollama are recognized as the same entry,
+    # without ever widening the match to a *different* explicit tag of
+    # the same base name (see _normalize_tag - previously this added the
+    # bare base name for every installed model unconditionally, e.g.
+    # installing qwen2.5:3b also added bare "qwen2.5" to this set, which
+    # then falsely matched qwen2.5:0.5b, qwen2.5:7b, or any other
+    # never-pulled qwen2.5 variant as "installed" - letting the app
+    # attempt inference against a model that was never actually on disk).
+    return {normalize_tag(n) for n in names}
 
 
 def installed_models() -> list[ollama.OllamaModel]:
@@ -140,7 +157,7 @@ def installed_models() -> list[ollama.OllamaModel]:
 
 def is_installed(model_tag: str) -> bool:
     installed = installed_model_tags()
-    return model_tag in installed or model_tag.split(":")[0] in installed
+    return normalize_tag(model_tag) in installed
 
 
 def model_label(model_tag: str) -> str:

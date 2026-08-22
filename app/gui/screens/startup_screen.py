@@ -153,6 +153,12 @@ class StartupScreen(QWidget):
 
     model_chosen = Signal(str)
     skip_to_dashboard = Signal()
+    # Emitted when the person picks "View existing data" for a searched
+    # model tag that already has verified/published results on GitHub -
+    # the model is deliberately NOT pulled/installed for this path (see
+    # _pull_custom_model), so MainWindow must route straight to the
+    # Dashboard rather than the Benchmark screen.
+    view_data_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -613,25 +619,32 @@ class StartupScreen(QWidget):
         if backend.is_installed(tag):
             self.continue_btn.setText(f"Continue with {tag}  \u2192")
         else:
-            self.continue_btn.setText(f"Download {tag} to continue  \u2192")
+            # Not installed is no longer a hard block on Continue - it
+            # just means there's nothing to benchmark yet, so this takes
+            # the person straight to the Dashboard (see _on_continue_
+            # clicked) instead of forcing a pull they may not want right
+            # now. Pulling remains available any time from this row's own
+            # "Pull model" button.
+            self.continue_btn.setText(f"View dashboard for {tag}  \u2192")
 
     def _on_continue_clicked(self) -> None:
         tag = self.selected_model_tag
         if not tag or not self._connected:
             return
 
+        app_state.set_selected_model(tag)
         if not backend.is_installed(tag):
-            # Hard gate: never let the user reach Benchmark/Dashboard with
-            # a model that isn't actually pulled onto this device. Instead
-            # of proceeding, kick off the pull here (after the RAM check)
-            # and auto-continue once it finishes successfully.
-            if not self._confirm_ram_ok(tag):
-                return
-            self._auto_continue_tag = tag
-            self._start_pull(tag)
+            # Let the person proceed with a not-yet-installed model - they
+            # just can't run inference against it (run_screen.start_run()
+            # still hard-blocks that with a clear error). Route to the
+            # Dashboard rather than Benchmark, since there's nothing to
+            # configure/start for a model that isn't on this device yet;
+            # a "Pull model" button on this screen (and the toolbar's
+            # "Change" link back here) is always available if they decide
+            # to install it later.
+            self.view_data_requested.emit(tag)
             return
 
-        app_state.set_selected_model(tag)
         self.model_chosen.emit(tag)
 
     def _confirm_ram_ok(self, model_tag: str) -> bool:
@@ -670,7 +683,6 @@ class StartupScreen(QWidget):
     # ---------------- model list ----------------
 
     def _refresh_model_rows(self) -> None:
-        installed = backend.installed_model_tags()
         for tag, row in self.model_rows.items():
             if tag in self.pull_workers:
                 # A pull is actively running for this row - set_installed()
@@ -681,7 +693,14 @@ class StartupScreen(QWidget):
                 # underneath kept showing stale progress. Leave pulling
                 # rows alone; _pull_finished() refreshes them once done.
                 continue
-            row.set_installed(tag in installed or tag.split(":")[0] in installed)
+            # Route through backend.is_installed() (not a local re-check
+            # against installed_model_tags()) so every "is this installed"
+            # decision in the app shares one normalization rule - a
+            # previous local copy of this check here matched on bare base
+            # name only, which falsely marked e.g. qwen2.5:0.5b as
+            # installed whenever any other qwen2.5:* tag was actually on
+            # disk.
+            row.set_installed(backend.is_installed(tag))
         if self.selected_model_tag:
             self._update_ram_warning(self.selected_model_tag)
         self._update_continue_btn()
@@ -774,6 +793,45 @@ class StartupScreen(QWidget):
         tag = self.custom_model_input.text().strip()
         if not tag:
             return
+        # Normalize a bare tag (no ":size"/":variant") to its explicit
+        # ":latest" form right here at the point of entry - this is the
+        # only place a person-typed tag becomes a stored model_tag (row
+        # key, app_state.selected_model, Supabase custom_models), so
+        # doing it here means a bare "qwen2.5" can never end up selected/
+        # displayed anywhere in the app as a naked base name instead of a
+        # real, unambiguous tag.
+        tag = backend.normalize_tag(tag)
+
+        # Searching for a tag that isn't installed here yet but already has
+        # verified results published on GitHub is ambiguous: does the person
+        # want to see that existing data, or generate their own run? Ask,
+        # rather than silently kicking off a (possibly large, possibly
+        # unnecessary) pull. Only ask once per tag - if it's already a row
+        # here (already installed, or already decided on "run it myself"
+        # earlier this session), just fall through to the normal pull flow.
+        if tag not in self.model_rows and not backend.is_installed(tag) \
+                and public_results.has_published_result(tag):
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Verified results already available")
+            box.setText(f"\u201c{tag}\u201d already has verified benchmark results published on GitHub.")
+            box.setInformativeText(
+                "Would you like to view that existing data, or download this "
+                "model and run the benchmark yourself on this device?"
+            )
+            view_btn = box.addButton("View existing data", QMessageBox.ButtonRole.AcceptRole)
+            run_btn = box.addButton("Run benchmark myself", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(view_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is view_btn:
+                self.custom_model_input.clear()
+                self.view_data_requested.emit(tag)
+                return
+            if clicked is not run_btn:
+                return  # Cancel - leave the input text as-is, do nothing
+
         is_new = tag not in self.model_rows
         if is_new:
             row = ModelRow(tag, tag)

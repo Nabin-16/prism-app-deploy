@@ -16,7 +16,7 @@ from app.gui.screens.run_screen import RunScreen
 from app.gui.screens.dashboard_screen import DashboardScreen
 from app.gui.screens.settings_screen import SettingsScreen
 from app.gui.screens.home_screen import HomeScreen
-from app.services import backend, app_state, supabase_sync
+from app.services import backend, app_state, supabase_sync, public_results
 
 RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
 LOGO_ICON_PATH = RESOURCES_DIR / "prism_logo.png"      # mark only, used as window/app icon
@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
         self.home_screen.get_started_clicked.connect(self._on_home_get_started)
         self.startup_screen.model_chosen.connect(self._on_model_chosen)
         self.startup_screen.skip_to_dashboard.connect(self._on_skip_to_dashboard)
+        self.startup_screen.view_data_requested.connect(self._on_view_data_requested)
         self.run_screen.run_completed.connect(self._on_run_completed)
         self.run_screen.continue_requested.connect(lambda: self._show_tab("dashboard"))
         self.dashboard_screen.benchmark_requested.connect(self._on_benchmark_requested)
@@ -374,6 +375,42 @@ class MainWindow(QMainWindow):
         # there, so the user decides rather than being auto-redirected.
         self._show_tab("benchmark")
         self._maybe_resume_interrupted_run(model_tag)
+
+    def _on_view_data_requested(self, model_tag: str) -> None:
+        """Routes to the Dashboard without requiring the model to be
+        installed. Two callers share this path:
+          1. StartupScreen's "View existing data" choice for a searched
+             tag known to have verified GitHub results.
+          2. Continue on a not-yet-installed curated model, which has no
+             promised data at all - going to the Dashboard should just
+             show its (possibly empty) state, not an error.
+        Only case 1 is an error if the fetch fails - has_published_result()
+        distinguishes the two, since case 2 was never promised any data to
+        begin with. Neither case marks the model installed; if the person
+        later tries to start a fresh run against this tag anyway,
+        run_screen.start_run()'s existing "Model not installed" hard gate
+        still applies exactly as it does for any other not-installed tag -
+        this path never bypasses that check."""
+        conn = backend.get_conn()
+        if not backend.has_data(conn, model_tag) and public_results.has_published_result(model_tag):
+            imported = backend.import_public_result(model_tag)
+            if not imported:
+                QMessageBox.critical(
+                    self,
+                    "Couldn't load verified results",
+                    f"\u201c{model_tag}\u201d was expected to have published results, "
+                    "but they couldn't be downloaded right now. Check your "
+                    "connection and try again.",
+                )
+                return
+        self._show_app_chrome()
+        self.active_model = model_tag
+        app_state.set_selected_model(model_tag)
+        self.model_badge.set_model(backend.model_label(model_tag))
+        self.dashboard_screen.set_model(model_tag)
+        self.run_screen.preselect_model(model_tag)
+        self.outer_stack.setCurrentWidget(self.app_shell)
+        self._show_tab("dashboard")
 
     def _on_skip_to_dashboard(self) -> None:        # Belt-and-suspenders: the skip link itself is only shown when
         # Ollama is connected (see StartupScreen._refresh_skip_link_visibility),
