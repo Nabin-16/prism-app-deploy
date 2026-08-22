@@ -2,16 +2,16 @@
 
 Two distinct concepts (CLAUDE.md §21, §25–26):
 
-* :func:`config_fingerprint` — a deterministic hash answering *"are these two
+* :func:`config_fingerprint` - a deterministic hash answering *"are these two
   results equivalent?"* It is stable across machines and runs: same inputs →
   same hash. It intentionally binds the **Ollama model digest** (not just the
   ``mistral:7b`` tag), the dataset + ``DATASET_VERSION``, the template identities
   (per-template SHA-256), the prompt conditions, the inference parameters, the
   seed, the question count, and the protocol version.
-* :func:`new_benchmark_run_id` — a unique id answering *"which run produced
+* :func:`new_benchmark_run_id` - a unique id answering *"which run produced
   this?"* One per execution.
 
-The fingerprint is computed **per (model, dataset)** — the natural unit for the
+The fingerprint is computed **per (model, dataset)** - the natural unit for the
 future "an existing PRISM benchmark is available for this model on this dataset"
 lookup.
 """
@@ -67,7 +67,7 @@ def config_fingerprint(
         "template_version": template_version,
         # Sort template hashes for order-independence.
         "template_sha256": {key: template_sha256[key] for key in sorted(template_sha256)},
-        # Prompt conditions are semantically ordered — keep as a list.
+        # Prompt conditions are semantically ordered - keep as a list.
         "prompt_conditions": list(prompt_conditions),
         "temperature": temperature,
         "num_predict": num_predict,

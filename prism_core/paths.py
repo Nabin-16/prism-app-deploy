@@ -1,8 +1,8 @@
 """Run-scoped output layout.
 
 Each benchmark run writes under ``runs/<benchmark_run_id>/`` keeping the exact
-sibling-directory shape the research pipeline used — ``raw_responses/``,
-``parsed/``, ``scored/``, ``summary/`` — so the ported scorer's filename pairing
+sibling-directory shape the research pipeline used - ``raw_responses/``,
+``parsed/``, ``scored/``, ``summary/`` - so the ported scorer's filename pairing
 (``{dataset}__{safe_model}.jsonl``) and the report glob work unchanged. A
 canonical ``summary.json`` (the future-public artifact) sits at the run root.
 

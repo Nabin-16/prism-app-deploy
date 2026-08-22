@@ -1,6 +1,6 @@
 """PRISM consistency scorer (ScoringService).
 
-Ported from the research ``src/consistency_scorer.py`` — the first stage that
+Ported from the research ``src/consistency_scorer.py`` - the first stage that
 uses benchmark ground truth. Scores each parsed response against the expected
 answer and aggregates the five prompt conditions of a question into one
 question/model metrics record (agreement, ``prompt_sensitivity = 1 - agreement``,

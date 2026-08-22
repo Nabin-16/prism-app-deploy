@@ -1,10 +1,12 @@
 """
 PRISM theme system.
 
-Two palettes (dusk / paper), one QSS template. Native-desktop finish: sharp
-(0-4px) corners, real 1px hairline borders instead of shadows/rounded cards,
-flat surfaces, and the OS's own UI font. Nothing here should read as a
-"card on a webpage" — it should read as Qt/Windows/macOS chrome.
+Two palettes (dusk / paper), one QSS template. Soft, rounded finish: every
+card, panel, button, input, and table uses a generous corner radius (see
+R_SM / R_MD below) instead of sharp native-chrome corners, real 1px hairline
+borders instead of shadows, flat surfaces, and the OS's own UI font. The
+goal is a calmer, friendlier "app" feel rather than pointed/rectangular
+native chrome.
 """
 
 from __future__ import annotations
@@ -39,20 +41,20 @@ class Palette:
 
 DUSK = Palette(
     name="dusk",
-    bg="#000000",
-    surface="#0a0a0a",
-    surface_raised="#121212",
-    surface_hover="#1a1a1a",
-    text="#f2f2f2",
-    text_dim="#a3a3a3",
-    text_faint="#707070",
+    bg="#0b0b0e",
+    surface="#111114",
+    surface_raised="#18181c",
+    surface_hover="#212126",
+    text="#f2f2f3",
+    text_dim="#a8a8b0",
+    text_faint="#75757e",
     accent="#8f7cf2",
     accent_soft="#211f2b",
     accent_text="#c9befa",
     good="#5fd18e",
     warn="#e8b45c",
     bad="#ea6b6b",
-    hairline="#2c2c2c",
+    hairline="#2a2a30",
     shadow="#000000",
 )
 
@@ -75,18 +77,30 @@ PAPER = Palette(
     shadow="#c9c4b6",
 )
 
-# Sharp, native-chrome corner radii. Kept as named constants (rather than
-# 0 everywhere) so small controls like checkboxes/pills still read as
-# intentional rather than accidentally square.
+# Rounded corner radii, kept as named constants so every surface (cards,
+# panels, buttons, inputs, tables, pills) shares the same soft, friendly
+# roundedness instead of pointed rectangles.
 R_NONE = "0px"
-R_SM = "2px"
-R_MD = "3px"
+R_SM = "10px"
+R_MD = "14px"
+R_LG = "18px"
+
+
+UI_FONT = '"Inter", "Segoe UI", "SF Pro Text", "Helvetica Neue", "Noto Sans", sans-serif'
+# A serif face for headings/brand only - the rest of the chrome (nav, body
+# copy, controls) stays the native UI font so the app still reads as real OS
+# chrome, not a themed webpage. Reserved for titles and section headers,
+# giving the app the register of a research report rather than a product
+# dashboard. Data itself stays in the existing monospace (see MONO_FONT
+# below / the JetBrains-style QSS rules further down) - a report typeface
+# for prose, a tabular typeface for numbers, a UI typeface for controls.
+SERIF_FONT = '"Source Serif Pro", "Georgia", "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif'
 
 
 def build_qss(p: Palette) -> str:
     return f"""
     * {{
-        font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", "Noto Sans", sans-serif;
+        font-family: {UI_FONT};
         outline: none;
     }}
 
@@ -100,6 +114,10 @@ def build_qss(p: Palette) -> str:
         background: {p.bg};
     }}
 
+    QDialog {{
+        background: {p.surface};
+    }}
+
     /* ---------- Sidebar ---------- */
     #Sidebar {{
         background: {p.surface};
@@ -107,7 +125,8 @@ def build_qss(p: Palette) -> str:
     }}
     #SidebarBrand {{
         color: {p.text};
-        font-size: 16px;
+        font-family: {SERIF_FONT};
+        font-size: 17px;
         font-weight: 700;
         letter-spacing: 1.5px;
     }}
@@ -153,6 +172,38 @@ def build_qss(p: Palette) -> str:
         border: 1px solid {p.hairline};
         border-radius: {R_SM};
     }}
+    QFrame#ErrorBanner {{
+        background: {p.surface_raised};
+        border: 1px solid {p.bad};
+        border-left: 4px solid {p.bad};
+        border-radius: {R_SM};
+    }}
+    /* ---------- Dashboard (prompt-reliability layout) ---------- */
+    QWidget#DashboardContainer {{
+        background: {p.bg};
+    }}
+    QFrame#FilterBar {{
+        background: {p.surface};
+        border: 1px solid {p.hairline};
+        border-radius: {R_SM};
+    }}
+    QFrame#KpiCard {{
+        background: {p.surface_raised};
+        border: 1px solid {p.hairline};
+        border-radius: {R_SM};
+    }}
+    QLabel#KpiTitle {{
+        color: {p.text_dim};
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }}
+    QLabel#KpiValue {{
+        color: {p.text};
+        font-family: {SERIF_FONT};
+        font-size: 24px;
+        font-weight: 600;
+    }}
     QFrame#Divider {{
         background: {p.hairline};
         max-height: 1px;
@@ -161,12 +212,38 @@ def build_qss(p: Palette) -> str:
     }}
 
     /* ---------- Typography helpers ---------- */
-    QLabel#H1 {{ font-size: 20px; font-weight: 600; color: {p.text}; }}
-    QLabel#H2 {{ font-size: 14px; font-weight: 600; color: {p.text}; }}
-    QLabel#Body {{ font-size: 13px; color: {p.text_dim}; }}
-    QLabel#Faint {{ font-size: 11.5px; color: {p.text_faint}; }}
-    QLabel#Stat {{ font-size: 22px; font-weight: 600; color: {p.text}; }}
-    QLabel#StatLabel {{ font-size: 10.5px; color: {p.text_faint}; letter-spacing: 0.8px; }}
+    QLabel#H1 {{
+        font-family: {SERIF_FONT};
+        font-size: 22px;
+        font-weight: 600;
+        color: {p.text};
+        letter-spacing: 0.1px;
+    }}
+    QLabel#H2 {{
+        font-family: {SERIF_FONT};
+        font-size: 15.5px;
+        font-weight: 600;
+        color: {p.text};
+        letter-spacing: 0.1px;
+    }}
+    QLabel#Body {{
+        font-size: 13px;
+        color: {p.text_dim};
+        line-height: 150%;
+    }}
+    QLabel#Faint {{
+        font-size: 11.5px;
+        color: {p.text_faint};
+        letter-spacing: 0.15px;
+    }}
+    QLabel#Kicker {{
+        font-size: 11px;
+        font-weight: 700;
+        color: {p.text_faint};
+        letter-spacing: 2px;
+    }}
+    QLabel#Stat {{ font-family: "Cascadia Mono", "SFMono-Regular", "Consolas", "Menlo", monospace; font-size: 22px; font-weight: 600; color: {p.text}; }}
+    QLabel#StatLabel {{ font-size: 10.5px; color: {p.text_faint}; letter-spacing: 0.8px; text-transform: uppercase; }}
     QLabel#Pill {{
         padding: 2px 9px;
         border: 1px solid {p.hairline};
@@ -182,9 +259,10 @@ def build_qss(p: Palette) -> str:
         color: {p.text};
         border: 1px solid {p.hairline};
         border-radius: {R_SM};
-        padding: 6px 14px;
+        padding: 7px 16px;
         font-size: 12.5px;
         font-weight: 500;
+        letter-spacing: 0.1px;
     }}
     QPushButton:hover {{ background: {p.surface_hover}; border-color: {p.text_faint}; }}
     QPushButton:pressed {{ background: {p.accent_soft}; }}
@@ -222,7 +300,7 @@ def build_qss(p: Palette) -> str:
         background: {p.surface_raised};
         border: 1px solid {p.hairline};
         border-radius: {R_SM};
-        padding: 6px 9px;
+        padding: 7px 10px;
         color: {p.text};
         selection-background-color: {p.accent_soft};
     }}
@@ -283,7 +361,7 @@ def build_qss(p: Palette) -> str:
         background: {p.surface};
         alternate-background-color: {p.surface_raised};
         border: 1px solid {p.hairline};
-        border-radius: {R_NONE};
+        border-radius: {R_SM};
         gridline-color: {p.hairline};
         selection-background-color: {p.accent_soft};
         selection-color: {p.text};
@@ -365,65 +443,93 @@ def build_qss(p: Palette) -> str:
 
     QSplitter::handle {{ background: {p.hairline}; }}
 
-    /* ---------- Startup / splash screen ---------- */
+    /* ---------- Startup / splash screen (single elongated, unboxed column) ---------- */
     #StartupRoot {{
-        background: {p.bg};
+        background: {p.surface};
+    }}
+    QLabel#StartupEyebrow {{
+        color: {p.text_faint};
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 2.6px;
+    }}
+    QLabel#BrandIcon {{
+        margin: 0 0 0 6px;
     }}
     QLabel#BrandMark {{
         color: {p.text};
-        font-size: 13px;
+        font-size: 15px;
         font-weight: 700;
         letter-spacing: 1.5px;
-    }}
-    QFrame#StartupCard {{
-        background: transparent;
-        border: none;
+        margin: 0 10px 0 6px;
     }}
     QLabel#StartupTitle {{
-        font-size: 20px;
+        font-family: {SERIF_FONT};
+        font-size: 26px;
         font-weight: 600;
         color: {p.text};
+        letter-spacing: 0.2px;
     }}
     QLabel#StartupSubtitle {{
-        font-size: 12.5px;
+        font-size: 13px;
         color: {p.text_dim};
+        line-height: 150%;
     }}
     QLabel#StartupFootnote {{
         font-size: 11px;
         color: {p.text_faint};
     }}
     QLabel#StartupStatusText {{
-        font-size: 12px;
+        font-size: 12.5px;
         color: {p.text_dim};
         font-weight: 600;
+        letter-spacing: 0.2px;
     }}
     QLabel#FieldLabel {{
-        font-size: 11.5px;
+        font-size: 11px;
         font-weight: 700;
-        color: {p.text_dim};
-        letter-spacing: 0.3px;
-        margin-top: 6px;
+        color: {p.text_faint};
+        letter-spacing: 1px;
     }}
-    QComboBox#StartupCombo {{
+    QComboBox#StartupCombo, QLineEdit#StartupCombo {{
         background: {p.surface_raised};
         border: 1px solid {p.hairline};
         border-radius: {R_SM};
-        padding: 7px 10px;
-        font-size: 13px;
+        padding: 8px 12px;
+        font-size: 13.5px;
         color: {p.text};
     }}
-    QComboBox#StartupCombo:focus {{ border: 1px solid {p.accent}; }}
+    QComboBox#StartupCombo:focus, QLineEdit#StartupCombo:focus {{ border: 1px solid {p.accent}; }}
+    QLabel#SectionLabel {{
+        font-size: 12.5px;
+        font-weight: 700;
+        color: {p.text_dim};
+        letter-spacing: 0.2px;
+    }}
+    QLabel#ModelRowStar {{
+        color: {p.warn};
+        font-size: 15px;
+    }}
     QPushButton#StartupPrimaryBtn, QPushButton#StartupPrimaryBtnReady {{
         background: {p.accent};
         color: #ffffff;
         border: 1px solid {p.accent};
-        border-radius: {R_SM};
-        font-size: 13px;
-        font-weight: 600;
+        border-radius: {R_MD};
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
     }}
     QPushButton#StartupPrimaryBtn:hover, QPushButton#StartupPrimaryBtnReady:hover {{
         background: {p.accent_text};
         border-color: {p.accent_text};
+    }}
+    /* Compact warning banner inside the "Select a model" panel - only
+    shown when Ollama isn't reachable, in place of the old full-screen
+    connecting/error hero. */
+    QFrame#StartupWarningBanner {{
+        background: rgba(234,107,107,0.08);
+        border: 1px solid rgba(234,107,107,0.35);
+        border-radius: {R_SM};
     }}
     QPushButton#StartupSkipLink {{
         background: transparent;
@@ -431,54 +537,63 @@ def build_qss(p: Palette) -> str:
         color: {p.accent_text};
         font-size: 11.5px;
         font-weight: 600;
-        text-align: left;
+        text-align: center;
         padding: 2px 0px;
     }}
     QPushButton#StartupSkipLink:hover {{
         color: {p.accent};
         text-decoration: underline;
     }}
-    QFrame#StartupModelsPanel {{
-        background: {p.surface};
-        border: 1px solid {p.hairline};
-        border-radius: {R_SM};
-    }}
-
-    /* ---------- Native desktop chrome: menu bar / toolbar / status bar ---------- */
-    QMenuBar {{
-        background: {p.surface};
-        color: {p.text_dim};
-        border-bottom: 1px solid {p.hairline};
-        padding: 1px 3px;
+    /* "Manage models" as a quiet inline toggle - no button box, just text
+    that gains a hairline underline on hover, matching the unboxed page. */
+    QPushButton#ManageModelsBtn {{
+        background: transparent;
+        border: none;
+        color: {p.accent_text};
         font-size: 12.5px;
+        font-weight: 600;
+        text-align: center;
+        padding: 4px 0px;
     }}
-    QMenuBar::item {{ background: transparent; padding: 4px 9px; border-radius: {R_SM}; }}
-    QMenuBar::item:selected {{ background: {p.surface_hover}; color: {p.text}; }}
-    QMenu {{
+    QPushButton#ManageModelsBtn:hover {{
+        color: {p.accent};
+        text-decoration: underline;
+    }}
+    QPushButton#ManageModelsBtn:pressed {{ color: {p.accent}; }}
+
+    /* Model list row on the startup screen - sits unboxed on the page
+    background (no parent card), so it carries its own subtle surface and
+    hairline; the whole row is clickable to select it, and a selected row
+    gets an accent border + soft accent tint instead of a checkmark. */
+    QFrame#ModelListRow {{
         background: {p.surface_raised};
-        color: {p.text};
         border: 1px solid {p.hairline};
         border-radius: {R_SM};
-        padding: 3px;
     }}
-    QMenu::item {{ padding: 6px 14px; border-radius: {R_SM}; }}
-    QMenu::item:selected {{ background: {p.accent_soft}; color: {p.accent_text}; }}
-    QMenu::separator {{ height: 1px; background: {p.hairline}; margin: 5px 4px; }}
+    QFrame#ModelListRow:hover {{
+        background: {p.surface_hover};
+    }}
+    QFrame#ModelListRow[selected="true"] {{
+        background: {p.accent_soft};
+        border: 1.5px solid {p.accent};
+    }}
 
+    /* ---------- Native desktop chrome: toolbar / status bar (menu bar removed) ---------- */
     QToolBar#AppToolBar {{
         background: {p.surface};
         border-bottom: 1px solid {p.hairline};
-        padding: 5px 8px;
-        spacing: 3px;
+        padding: 9px 14px;
+        spacing: 4px;
     }}
     QToolBar#AppToolBar QToolButton {{
         background: transparent;
         color: {p.text_dim};
         border: 1px solid transparent;
         border-radius: {R_SM};
-        padding: 6px 12px;
+        padding: 7px 14px;
         font-size: 12.5px;
         font-weight: 500;
+        letter-spacing: 0.1px;
     }}
     QToolBar#AppToolBar QToolButton:hover {{ background: {p.surface_hover}; color: {p.text}; }}
     QToolBar#AppToolBar QToolButton:checked {{
@@ -509,6 +624,20 @@ def build_qss(p: Palette) -> str:
         color: {p.text_faint};
         font-size: 9.5px;
         letter-spacing: 0.5px;
+    }}
+    QPushButton#ChangeModelBtn {{
+        background: {p.surface_raised};
+        color: {p.accent_text};
+        border: 1px solid {p.hairline};
+        border-radius: {R_SM};
+        padding: 6px 13px;
+        font-size: 12px;
+        font-weight: 600;
+    }}
+    QPushButton#ChangeModelBtn:hover {{
+        background: {p.accent};
+        color: #ffffff;
+        border-color: {p.accent};
     }}
     QPushButton#CompareBtn {{
         background: {p.surface_raised};

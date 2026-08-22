@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QActionGroup, QAction
+from PySide6.QtGui import QActionGroup, QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QStackedWidget, QToolBar, QStatusBar,
-    QLabel, QPushButton, QMessageBox,
+    QLabel, QPushButton,
 )
 
 from app.gui.theme import DUSK, PAPER, build_qss
@@ -14,6 +16,10 @@ from app.gui.screens.run_screen import RunScreen
 from app.gui.screens.dashboard_screen import DashboardScreen
 from app.gui.screens.settings_screen import SettingsScreen
 from app.services import backend, app_state, supabase_sync
+
+RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
+LOGO_ICON_PATH = RESOURCES_DIR / "prism_logo.png"      # mark only, used as window/app icon
+LOGO_WORDMARK_PATH = RESOURCES_DIR / "prism_text.png"  # mark + "PRISM" wordmark, used in the toolbar
 
 
 class MainWindow(QMainWindow):
@@ -28,7 +34,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("PRISM \u2014 Prompt-Reliability Benchmark")
+        self.setWindowTitle("PRISM - Prompt-Reliability Benchmark")
+        if LOGO_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(LOGO_ICON_PATH)))
         self.resize(1220, 780)
         self.setMinimumSize(1000, 660)
 
@@ -65,8 +73,7 @@ class MainWindow(QMainWindow):
 
         self.outer_stack.addWidget(self.app_shell)
 
-        # ---------- native chrome: menu bar / toolbar / status bar ----------
-        self._build_menu_bar()
+        # ---------- native chrome: toolbar / status bar (menu bar removed) ----------
         self._build_toolbar()
         self._build_status_bar()
 
@@ -81,8 +88,10 @@ class MainWindow(QMainWindow):
         self.settings_screen.set_active(self._theme)
         self.apply_theme(self._theme)
 
+        backend.ensure_bundled_seed()
         has_existing = bool(backend.models_with_data(backend.get_conn()))
         self.startup_screen.set_existing_results_available(has_existing)
+        self._show_startup_chrome()
         self.outer_stack.setCurrentWidget(self.startup_screen)
 
         self._ollama_timer = QTimer(self)
@@ -92,40 +101,28 @@ class MainWindow(QMainWindow):
 
     # ---------------- chrome construction ----------------
 
-    def _build_menu_bar(self) -> None:
-        menu_bar = self.menuBar()
-
-        file_menu = menu_bar.addMenu("&File")
-        change_model_action = QAction("Change active model\u2026", self)
-        change_model_action.triggered.connect(self._go_to_startup)
-        file_menu.addAction(change_model_action)
-        file_menu.addSeparator()
-        exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
-
-        view_menu = menu_bar.addMenu("&View")
-        theme_group = QActionGroup(self)
-        theme_group.setExclusive(True)
-        self.dusk_action = QAction("Dusk (dark)", self, checkable=True)
-        self.paper_action = QAction("Paper (light)", self, checkable=True)
-        for a in (self.dusk_action, self.paper_action):
-            theme_group.addAction(a)
-            view_menu.addAction(a)
-        self.dusk_action.triggered.connect(lambda: self.apply_theme("dusk"))
-        self.paper_action.triggered.connect(lambda: self.apply_theme("paper"))
-
-        help_menu = menu_bar.addMenu("&Help")
-        about_action = QAction("About PRISM", self)
-        about_action.triggered.connect(self._show_about)
-        help_menu.addAction(about_action)
-
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main")
         toolbar.setObjectName("AppToolBar")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         self.addToolBar(toolbar)
+
+        # Brand mark (leading, like a native app's toolbar icon) - the
+        # icon-only mark, with the "PRISM" name set as real text beside it
+        # rather than baked into a wordmark image.
+        brand_icon = QLabel()
+        brand_icon.setObjectName("BrandIcon")
+        if LOGO_ICON_PATH.exists():
+            pix = QPixmap(str(LOGO_ICON_PATH))
+            if not pix.isNull():
+                brand_icon.setPixmap(pix.scaledToHeight(32, Qt.TransformationMode.SmoothTransformation))
+        toolbar.addWidget(brand_icon)
+
+        brand_text = QLabel("PRISM")
+        brand_text.setObjectName("BrandMark")
+        toolbar.addWidget(brand_text)
+        self.toolbar_separator = toolbar.addSeparator()
 
         nav_group = QActionGroup(self)
         nav_group.setExclusive(True)
@@ -144,17 +141,28 @@ class MainWindow(QMainWindow):
         # expanding spacer pushes the model badge / change button to the
         # right edge of the toolbar, like a native app's trailing toolbar items
         from PySide6.QtWidgets import QSizePolicy
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        toolbar.addWidget(spacer)
+        self.toolbar_spacer = QWidget()
+        self.toolbar_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.toolbar_spacer_action = toolbar.addWidget(self.toolbar_spacer)
 
         self.model_badge = ModelBadge()
-        toolbar.addWidget(self.model_badge)
+        self.model_badge_action = toolbar.addWidget(self.model_badge)
 
         self.change_model_btn = QPushButton("Change")
+        self.change_model_btn.setObjectName("ChangeModelBtn")
         self.change_model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.change_model_btn.clicked.connect(self._go_to_startup)
-        toolbar.addWidget(self.change_model_btn)
+        self.change_model_btn.clicked.connect(self._on_change_model_requested)
+        self.change_model_btn_action = toolbar.addWidget(self.change_model_btn)
+
+        # Widgets added to a QToolBar are wrapped in a QAction under the
+        # hood; the toolbar's own layout re-shows the wrapped widget based
+        # on THAT action's visibility whenever the toolbar is (re)shown or
+        # polished, regardless of what setVisible() was called directly on
+        # the widget. So hide/show must go through these actions, not the
+        # widgets themselves, or the widgets flash back to visible the
+        # moment the window is first shown.
+        self.model_badge_action.setVisible(False)
+        self.change_model_btn_action.setVisible(False)
 
         self.nav_dashboard.setChecked(True)
 
@@ -167,7 +175,43 @@ class MainWindow(QMainWindow):
         self.data_path_lbl = QLabel(f"Local data: {backend.APP_DIR}")
         bar.addWidget(self.data_path_lbl)
 
+    # ------------------------------------------------------------ Qt events
+
+    def showEvent(self, event) -> None:
+        """Qt re-reveals explicitly-hidden child widgets the first time a
+        top-level window is shown, which would otherwise undo the
+        model-badge/Change-button hide() applied in __init__ (before
+        main.py's window.show() ever runs). Re-apply whichever chrome
+        state is correct for the screen currently on top once the window
+        is actually on screen, so the startup screen never flashes them.
+        """
+        super().showEvent(event)
+        if self.outer_stack.currentWidget() is self.startup_screen:
+            self._show_startup_chrome()
+        else:
+            self._show_app_chrome()
+
     # ---------------- navigation ----------------
+
+    def _show_startup_chrome(self) -> None:
+        """On the startup screen, the toolbar shows only the brand mark - no Dashboard/Benchmark/Settings nav, no model badge, no status bar - since there's no active model or app state yet to navigate
+        around."""
+        for action in (self.nav_dashboard, self.nav_benchmark, self.nav_settings):
+            action.setVisible(False)
+        self.toolbar_separator.setVisible(False)
+        self.toolbar_spacer_action.setVisible(False)
+        self.model_badge_action.setVisible(False)
+        self.change_model_btn_action.setVisible(False)
+        self.statusBar().setVisible(False)
+
+    def _show_app_chrome(self) -> None:
+        for action in (self.nav_dashboard, self.nav_benchmark, self.nav_settings):
+            action.setVisible(True)
+        self.toolbar_separator.setVisible(True)
+        self.toolbar_spacer_action.setVisible(True)
+        self.model_badge_action.setVisible(True)
+        self.change_model_btn_action.setVisible(True)
+        self.statusBar().setVisible(True)
 
     def _show_tab(self, key: str) -> None:
         mapping = {
@@ -181,22 +225,22 @@ class MainWindow(QMainWindow):
         action.setChecked(True)
         self.content_stack.setCurrentWidget(widget)
 
-    def _go_to_startup(self) -> None:
-        self.outer_stack.setCurrentWidget(self.startup_screen)
-
     def _on_model_chosen(self, model_tag: str) -> None:
+        self._show_app_chrome()
         self.active_model = model_tag
         self.model_badge.set_model(backend.model_label(model_tag))
         self.dashboard_screen.set_model(model_tag)
         self.run_screen.preselect_model(model_tag)
         self.outer_stack.setCurrentWidget(self.app_shell)
 
-        if backend.has_data(backend.get_conn(), model_tag):
-            self._show_tab("dashboard")
-        else:
-            self._show_tab("benchmark")
+        # Always land on the Benchmark screen after startup - if this model
+        # already has local results, preselect_model() above has already
+        # surfaced its own "Existing results found - View dashboard" prompt
+        # there, so the user decides rather than being auto-redirected.
+        self._show_tab("benchmark")
 
     def _on_skip_to_dashboard(self) -> None:
+        self._show_app_chrome()
         conn = backend.get_conn()
         model_tag = app_state.get_selected_model()
         if not model_tag or not backend.has_data(conn, model_tag):
@@ -211,6 +255,17 @@ class MainWindow(QMainWindow):
         self.outer_stack.setCurrentWidget(self.app_shell)
         self._show_tab("dashboard")
 
+    def _on_change_model_requested(self) -> None:
+        """'Change' button on the toolbar model badge - drops the user back
+        onto the startup screen's model picker so they can switch the
+        active model. The badge (and this button) are hidden on the
+        startup screen itself, so this is only reachable from the other
+        screens."""
+        has_existing = bool(backend.models_with_data(backend.get_conn()))
+        self.startup_screen.set_existing_results_available(has_existing)
+        self._show_startup_chrome()
+        self.outer_stack.setCurrentWidget(self.startup_screen)
+
     def _on_run_completed(self, model_tag: str) -> None:
         # Refresh regardless of whether this was the active model (a re-run)
         # or a "compare" target model run from the dashboard's compare drawer.
@@ -222,16 +277,6 @@ class MainWindow(QMainWindow):
             return
         self.run_screen.preselect_model(model_tag)
         self._show_tab("benchmark")
-
-    def _show_about(self) -> None:
-        QMessageBox.information(
-            self, "About PRISM",
-            "PRISM \u2014 Prompt-Reliability Benchmark\n\n"
-            "Measures how reliably small language models answer the same "
-            "question phrased five semantically-equivalent ways, running "
-            "entirely against a local Ollama installation.\n\n"
-            "Engine: prism_core (Qt-free) \u00b7 GUI: PySide6",
-        )
 
     def _refresh_ollama_status(self) -> None:
         if backend.ollama_available():
@@ -271,9 +316,8 @@ class MainWindow(QMainWindow):
         palette = DUSK if name == "dusk" else PAPER
         self.setStyleSheet(build_qss(palette))
         self.settings_screen.set_active(name)
-        self.dusk_action.setChecked(name == "dusk")
-        self.paper_action.setChecked(name == "paper")
         # chart title/legend/axis colors are picked per-theme at draw time,
         # so a live theme switch needs a repaint to actually show the fix
-        if hasattr(self, "dashboard_screen"):
+        if hasattr(self, "dashboard_screen"
+                   ):
             self.dashboard_screen.refresh()

@@ -4,8 +4,8 @@ Ported from the research ``src/summary_report.py``. Reads the question-level
 metrics produced by :mod:`prism_core.scoring` and rolls them up into the two
 report CSVs:
 
-* ``model_dataset_summary.csv`` — one row per model × dataset,
-* ``model_prompt_summary.csv``  — one row per model × dataset × prompt condition.
+* ``model_dataset_summary.csv`` - one row per model × dataset,
+* ``model_prompt_summary.csv`` - one row per model × dataset × prompt condition.
 
 The aggregation math, the metric distinctions (recovery vs. compliance vs.
 accuracy), the rounding, and the column order are unchanged, so the CSVs match

@@ -3,9 +3,58 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QGraphicsDropShadowEffect,
-    QPushButton,
+    QPushButton, QSizePolicy,
 )
 from PySide6.QtGui import QColor
+
+
+# Ported from prompt-reliability's prism_app/widgets/layout.py: a
+# horizontally-centred, max-width content column. Used to blend that
+# project's calmer single-column composition into screens (like the
+# Benchmark screen) that would otherwise stretch to the full window width.
+CONTENT_MAX_WIDTH = 900
+
+
+def centered_column(
+    host: QWidget,
+    *,
+    max_width: int = CONTENT_MAX_WIDTH,
+    margins: tuple[int, int, int, int] = (24, 24, 24, 24),
+    spacing: int = 16,
+) -> QVBoxLayout:
+    """Install a horizontally-centred, max-width content column on *host*.
+
+    Returns the inner QVBoxLayout for the screen's content - a view's own
+    build method keeps adding widgets to the returned layout exactly as
+    before. On windows narrower than *max_width* the column simply uses
+    whatever width is available.
+    """
+    outer = QHBoxLayout(host)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+    outer.addStretch(1)
+
+    column = QWidget()
+    column.setObjectName("ContentColumn")
+    column.setMaximumWidth(max_width)
+    column.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    outer.addWidget(column, 20)
+
+    outer.addStretch(1)
+
+    inner = QVBoxLayout(column)
+    inner.setContentsMargins(*margins)
+    inner.setSpacing(spacing)
+    return inner
+
+
+def status_badge(text: str, object_name: str = "StateBadge") -> QLabel:
+    """Small pill-style status label, ported in spirit from
+    prompt-reliability's progress_view state badge (READY/RUNNING/etc.)."""
+    lbl = QLabel(text)
+    lbl.setObjectName(object_name)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return lbl
 
 
 def card(object_name: str = "Card") -> QFrame:
@@ -38,9 +87,15 @@ def body(text: str) -> QLabel:
     return lbl
 
 
-def faint(text: str) -> QLabel:
+def faint(text: str, wrap: bool = True) -> QLabel:
     lbl = QLabel(text)
     lbl.setObjectName("Faint")
+    # Word-wrap by default so short captions used inside fixed/half-width
+    # cards (e.g. side-by-side section cards) never force the layout wider
+    # than its container - that forced-width was clipping cards at narrow
+    # window sizes instead of reflowing. Callers that truly want a single-
+    # line caption (pills, inline stat labels) can pass wrap=False.
+    lbl.setWordWrap(wrap)
     return lbl
 
 
@@ -60,7 +115,7 @@ def pill(text: str, color: str, soft_bg: str) -> QLabel:
 
 
 class StatTile(QFrame):
-    def __init__(self, label: str, value: str = "—", parent=None):
+    def __init__(self, label: str, value: str = " - ", parent=None):
         super().__init__(parent)
         self.setObjectName("CardRaised")
         lay = QVBoxLayout(self)
@@ -98,7 +153,7 @@ class MetricTile(QFrame):
     """A dense stat tile: big value, small caption. Used on the model-scoped
     dashboard header (accuracy, agreement, questions run, etc.)."""
 
-    def __init__(self, label: str, value: str = "—", parent=None):
+    def __init__(self, label: str, value: str = " - ", parent=None):
         super().__init__(parent)
         self.setObjectName("CardRaised")
         lay = QVBoxLayout(self)
@@ -150,7 +205,7 @@ class ModelBadge(QFrame):
 
 
 class EmptyStateCTA(QFrame):
-    """'No data yet' card with a single call-to-action button — used for the
+    """'No data yet' card with a single call-to-action button - used for the
     compare panel when the chosen model hasn't been benchmarked locally."""
 
     def __init__(self, title: str, body_text: str, button_text: str, parent=None):

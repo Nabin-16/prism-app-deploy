@@ -3,10 +3,10 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QPushButton, QCheckBox,
-    QSpinBox, QProgressBar, QPlainTextEdit, QScrollArea, QGridLayout,
+    QSpinBox, QProgressBar, QPlainTextEdit, QScrollArea, QGridLayout, QMessageBox,
 )
 
-from app.gui.widgets import card, h2, body, faint, divider, SectionHeader, MetricTile, kicker
+from app.gui.widgets import card, h2, body, faint, divider, SectionHeader, MetricTile, kicker, centered_column
 from app.services import backend
 from app.services.backend import BenchmarkWorker
 
@@ -30,6 +30,8 @@ class RunScreen(QWidget):
         super().__init__(parent)
         self.worker: BenchmarkWorker | None = None
         self.model_tag: str | None = None
+        self._success_count = 0
+        self._error_count = 0
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -40,43 +42,84 @@ class RunScreen(QWidget):
 
         content = QWidget()
         scroll.setWidget(content)
-        root = QVBoxLayout(content)
-        root.setContentsMargins(28, 24, 28, 28)
-        root.setSpacing(18)
+        # prompt-reliability's centred, max-width composition, applied on
+        # top of prism-build's own screen/card structure below.
+        root = centered_column(content, max_width=900, margins=(28, 24, 28, 28), spacing=16)
+
+        # ---- header row: title/subtitle on the left, primary actions on
+        # the right - mirrors Nabin's compact top bar instead of stacking
+        # the Start/Cancel controls under a full-width config card. ----
+        header_row = QHBoxLayout()
+        header_row.setSpacing(16)
 
         header_col = QVBoxLayout()
         header_col.setSpacing(2)
         header_col.addWidget(kicker("Benchmark"))
         self.title_lbl = QLabel("Run benchmark")
         self.title_lbl.setObjectName("H1")
+        self.title_lbl.setWordWrap(True)
         header_col.addWidget(self.title_lbl)
         self.sub_lbl = body(
             "Runs the full PRISM pipeline for this model: inference \u2192 parsing \u2192 "
-            "consistency scoring \u2192 summary — against your local Ollama installation."
+            "consistency scoring \u2192 summary - against your local Ollama installation."
         )
         header_col.addWidget(self.sub_lbl)
-        root.addLayout(header_col)
+        header_row.addLayout(header_col, 1)
 
-        config_card = card("Card")
-        cl = QVBoxLayout(config_card)
-        cl.setContentsMargins(24, 22, 24, 22)
-        cl.setSpacing(14)
+        action_col = QVBoxLayout()
+        action_col.setSpacing(8)
+        action_col.addStretch(1)
+        self.start_btn = QPushButton("Start benchmark  \u25b6")
+        self.start_btn.setObjectName("Primary")
+        self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.start_btn.setFixedHeight(40)
+        self.start_btn.setMinimumWidth(150)
+        self.start_btn.clicked.connect(self.start_run)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(40)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("Danger")
+        self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_btn.setFixedHeight(40)
+        self.cancel_btn.setMinimumWidth(150)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_run)
 
-        ds_col = QVBoxLayout()
-        ds_col.addWidget(h2("Datasets"))
+        action_col.addWidget(self.start_btn)
+        action_col.addWidget(self.cancel_btn)
+        header_row.addLayout(action_col, 0)
+        root.addLayout(header_row)
+
+        # ---- Datasets & Options: two clearly-separated section cards, in
+        # the spirit of Nabin's individually-boxed "Datasets" / "Sampling &
+        # Protocol" sections rather than one card holding both in an inline
+        # grid. Stacked vertically (not side by side) so neither card's
+        # minimum width can force the row wider than the window - that
+        # forced width was what clipped the "Options" card at the edges on
+        # narrower windows instead of letting the layout reflow. ----
+        sections_row = QVBoxLayout()
+        sections_row.setSpacing(16)
+
+        dataset_card = card("Card")
+        ds_lay = QVBoxLayout(dataset_card)
+        ds_lay.setContentsMargins(22, 18, 22, 20)
+        ds_lay.setSpacing(10)
+        ds_lay.addWidget(h2("Datasets"))
+        ds_lay.addWidget(faint("Choose which benchmark datasets to run."))
         self.dataset_checks: dict[str, QCheckBox] = {}
         for name in backend.datasets_catalog():
             cb = QCheckBox(name.replace("_", " ").title())
             cb.setChecked(True)
             self.dataset_checks[name] = cb
-            ds_col.addWidget(cb)
-        grid.addLayout(ds_col, 0, 0)
+            ds_lay.addWidget(cb)
+        ds_lay.addStretch(1)
+        sections_row.addWidget(dataset_card)
 
-        opts_col = QVBoxLayout()
-        opts_col.addWidget(h2("Options"))
+        options_card = card("Card")
+        opts_lay = QVBoxLayout(options_card)
+        opts_lay.setContentsMargins(22, 18, 22, 20)
+        opts_lay.setSpacing(10)
+        opts_lay.addWidget(h2("Options"))
+        opts_lay.addWidget(faint("Sampling limits and re-run behaviour."))
         limit_row = QHBoxLayout()
         limit_row.addWidget(faint("Max questions"))
         self.max_q_spin = QSpinBox()
@@ -84,34 +127,14 @@ class RunScreen(QWidget):
         self.max_q_spin.setValue(0)
         self.max_q_spin.setSpecialValueText("All")
         limit_row.addWidget(self.max_q_spin)
-        opts_col.addLayout(limit_row)
+        limit_row.addStretch(1)
+        opts_lay.addLayout(limit_row)
         self.overwrite_cb = QCheckBox("Overwrite completed requests")
-        opts_col.addWidget(self.overwrite_cb)
-        opts_col.addStretch(1)
-        grid.addLayout(opts_col, 0, 1)
+        opts_lay.addWidget(self.overwrite_cb)
+        opts_lay.addStretch(1)
+        sections_row.addWidget(options_card)
 
-        cl.addLayout(grid)
-        cl.addWidget(divider())
-
-        action_row = QHBoxLayout()
-        self.start_btn = QPushButton("Start benchmark")
-        self.start_btn.setObjectName("Primary")
-        self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.start_btn.setFixedHeight(38)
-        self.start_btn.clicked.connect(self.start_run)
-
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setObjectName("Danger")
-        self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.cancel_btn.setEnabled(False)
-        self.cancel_btn.clicked.connect(self.cancel_run)
-
-        action_row.addWidget(self.start_btn)
-        action_row.addWidget(self.cancel_btn)
-        action_row.addStretch(1)
-        cl.addLayout(action_row)
-
-        root.addWidget(config_card)
+        root.addLayout(sections_row)
 
         # ---- Live progress ----
         progress_card = card("CardRaised")
@@ -119,11 +142,18 @@ class RunScreen(QWidget):
         pl.setContentsMargins(24, 22, 24, 22)
         pl.setSpacing(12)
 
+        status_head = QHBoxLayout()
+        status_head.setSpacing(8)
+        self.status_dot = QLabel("\u25cf")
+        self.status_dot.setObjectName("Faint")
+        status_head.addWidget(self.status_dot)
         self.status_title = QLabel("Idle")
         self.status_title.setObjectName("H2")
+        status_head.addWidget(self.status_title)
+        status_head.addStretch(1)
+        pl.addLayout(status_head)
         self.status_sub = QLabel("Configure a run above and press Start.")
         self.status_sub.setObjectName("Body")
-        pl.addWidget(self.status_title)
         pl.addWidget(self.status_sub)
 
         overall_lbl_row = QHBoxLayout()
@@ -134,6 +164,8 @@ class RunScreen(QWidget):
         overall_lbl_row.addWidget(self.overall_pct_lbl)
         pl.addLayout(overall_lbl_row)
 
+        self._stage_index = 0
+        self._stage_count = 0
         self.overall_bar = QProgressBar()
         self.overall_bar.setObjectName("OverallBar")
         self.overall_bar.setRange(0, 100)
@@ -158,21 +190,108 @@ class RunScreen(QWidget):
         self.dataset_bar.setFixedHeight(10)
         pl.addWidget(self.dataset_bar)
 
-        stats_row = QHBoxLayout()
-        self.stat_dataset = MetricTile("Dataset", "\u2014")
+        # Dense 3-column stat grid (2 rows) instead of two separate full
+        # rows - a more compact, desktop-panel-like read-out.
+        stats_grid = QGridLayout()
+        stats_grid.setHorizontalSpacing(12)
+        stats_grid.setVerticalSpacing(12)
+        self.stat_dataset = MetricTile("Dataset", "-")
         self.stat_requests = MetricTile("Requests", "0 / 0")
-        self.stat_latency = MetricTile("Avg latency", "\u2014")
-        self.stat_eta = MetricTile("Est. time left", "\u2014")
-        for s in (self.stat_dataset, self.stat_requests, self.stat_latency, self.stat_eta):
-            stats_row.addWidget(s)
-        pl.addLayout(stats_row)
-
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setFixedHeight(150)
-        pl.addWidget(self.log)
+        self.stat_latency = MetricTile("Avg latency", "-")
+        self.stat_eta = MetricTile("Est. time left", "-")
+        # Successful vs. errored requests, tallied live from the same
+        # request_progress stream that drives stat_requests above - a
+        # quick at-a-glance health check without having to read the log.
+        self.stat_success = MetricTile("Successful", "0")
+        self.stat_errors = MetricTile("Errors", "0")
+        tiles = (
+            self.stat_dataset, self.stat_requests, self.stat_latency,
+            self.stat_eta, self.stat_success, self.stat_errors,
+        )
+        for i, tile in enumerate(tiles):
+            stats_grid.addWidget(tile, i // 3, i % 3)
+        pl.addLayout(stats_grid)
 
         root.addWidget(progress_card)
+
+        # ---- Run log ----
+        # Plain-text, append-only feed of stage transitions and per-request
+        # errors, driven by _on_stage/_on_progress/_on_finished/
+        # _on_fatal_halt below. Read-only so it can't be edited, monospace
+        # so timestamps/markers line up.
+        log_card = card("Card")
+        ll = QVBoxLayout(log_card)
+        ll.setContentsMargins(22, 18, 22, 18)
+        ll.setSpacing(8)
+        ll.addWidget(h2("Run log"))
+        self.log = QPlainTextEdit()
+        self.log.setObjectName("RunLog")
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("Log output will appear here once a run starts.")
+        self.log.setMinimumHeight(160)
+        self.log.setMaximumBlockCount(2000)  # cap growth on very long runs
+        log_font = self.log.font()
+        log_font.setFamily("Menlo, Consolas, monospace")
+        self.log.setFont(log_font)
+        ll.addWidget(self.log)
+        root.addWidget(log_card)
+
+        # ---- Crash-safe error banner (OOM / crash / lost connection) ----
+        # Shown only when inference halts on a fatal condition. The app
+        # itself never closes when this happens - the worker thread stops
+        # cleanly, everything gathered so far is already saved to disk, and
+        # the person chooses how to proceed.
+        self.error_banner = card("ErrorBanner")
+        self.error_banner.setVisible(False)
+        eb = QVBoxLayout(self.error_banner)
+        eb.setContentsMargins(20, 16, 20, 16)
+        eb.setSpacing(10)
+
+        eb_title_row = QHBoxLayout()
+        self.error_title = QLabel("Inference halted")
+        self.error_title.setObjectName("H2")
+        eb_title_row.addWidget(self.error_title)
+        eb_title_row.addStretch(1)
+        eb.addLayout(eb_title_row)
+
+        self.error_message = QLabel("")
+        self.error_message.setObjectName("Body")
+        self.error_message.setWordWrap(True)
+        eb.addWidget(self.error_message)
+
+        self.error_note = body(
+            "Everything completed before this point has been saved. The app "
+            "is still running - choose how to proceed."
+        )
+        eb.addWidget(self.error_note)
+
+        eb_actions = QHBoxLayout()
+        self.continue_run_btn = QPushButton("Continue")
+        self.continue_run_btn.setObjectName("Primary")
+        self.continue_run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.continue_run_btn.setToolTip(
+            "Resume from where it halted - already-completed requests are kept."
+        )
+        self.continue_run_btn.clicked.connect(self._on_continue_after_halt)
+        eb_actions.addWidget(self.continue_run_btn)
+
+        self.rerun_btn = QPushButton("Rerun from scratch")
+        self.rerun_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rerun_btn.setToolTip(
+            "Restart this dataset from the beginning, discarding partial results."
+        )
+        self.rerun_btn.clicked.connect(self._on_rerun)
+        eb_actions.addWidget(self.rerun_btn)
+
+        self.stop_run_btn = QPushButton("Stop")
+        self.stop_run_btn.setObjectName("Danger")
+        self.stop_run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_run_btn.clicked.connect(self._on_stop_after_halt)
+        eb_actions.addWidget(self.stop_run_btn)
+        eb_actions.addStretch(1)
+        eb.addLayout(eb_actions)
+
+        root.addWidget(self.error_banner)
         root.addStretch(1)
 
         continue_row = QHBoxLayout()
@@ -188,12 +307,12 @@ class RunScreen(QWidget):
 
     def preselect_model(self, model_tag: str) -> None:
         self.model_tag = model_tag
-        self.title_lbl.setText(f"Run benchmark \u2014 {backend.model_label(model_tag)}")
+        self.title_lbl.setText(f"Run benchmark - {backend.model_label(model_tag)}")
         self.continue_btn.setVisible(False)
         if backend.has_data(backend.get_conn(), model_tag):
             self.status_title.setText("Existing results found")
             self.status_sub.setText(
-                "This model already has local benchmark data \u2014 continue to the "
+                "This model already has local benchmark data - continue to the "
                 "dashboard, or start a fresh run above."
             )
             self.continue_btn.setVisible(True)
@@ -207,6 +326,27 @@ class RunScreen(QWidget):
         if not self.model_tag:
             self.status_title.setText("No model selected")
             self.status_sub.setText("Pick a model on the startup screen first.")
+            return
+
+        if not backend.is_installed(self.model_tag):
+            # Hard gate: a benchmark run against a model that isn't
+            # actually pulled onto this device would just fail against
+            # Ollama request by request - stop it here with a clear error
+            # instead.
+            QMessageBox.critical(
+                self,
+                "Model not installed",
+                (
+                    f"\u201c{self.model_tag}\u201d isn't pulled onto this device yet, "
+                    "so a benchmark can't run against it.\n\n"
+                    "Go back to model selection (\u201cChange\u201d in the toolbar) and "
+                    "download it first."
+                ),
+            )
+            self.status_title.setText("Model not installed")
+            self.status_sub.setText(
+                f"\u201c{self.model_tag}\u201d needs to be pulled before it can be benchmarked."
+            )
             return
 
         datasets = [n for n, cb in self.dataset_checks.items() if cb.isChecked()]
@@ -226,10 +366,19 @@ class RunScreen(QWidget):
         self.continue_btn.setVisible(False)
         self.status_title.setText("Starting\u2026")
         self.status_sub.setText(f"Warming up inference for {backend.model_label(self.model_tag)}")
-        self.stat_dataset.set_value("\u2014")
+        self.stat_dataset.set_value("-")
         self.stat_requests.set_value("0 / 0")
-        self.stat_latency.set_value("\u2014")
-        self.stat_eta.set_value("\u2014")
+        self.stat_latency.set_value("-")
+        self.stat_eta.set_value("-")
+        self._success_count = 0
+        self._error_count = 0
+        self.stat_success.set_value("0")
+        self.stat_errors.set_value("0")
+        self.stat_errors.value_lbl.setStyleSheet("")
+
+        self.error_banner.setVisible(False)
+        self._last_datasets = datasets
+        self._last_max_q = max_q
 
         self.worker = BenchmarkWorker(
             self.model_tag, datasets,
@@ -238,6 +387,7 @@ class RunScreen(QWidget):
         self.worker.stage.connect(self._on_stage)
         self.worker.request_progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_finished)
+        self.worker.fatal_halt.connect(self._on_fatal_halt)
         self.worker.start()
 
     def cancel_run(self) -> None:
@@ -246,11 +396,67 @@ class RunScreen(QWidget):
             self.status_sub.setText("Cancelling after the current request\u2026")
             self.cancel_btn.setEnabled(False)
 
+    def _on_fatal_halt(self, reason: str) -> None:
+        """A fatal condition (OOM, lost Ollama connection, repeated
+        failures) stopped inference. The worker thread is already winding
+        down cleanly on its own - this never touches the app's own event
+        loop or main thread, so the window stays fully responsive. Show the
+        banner so the person can decide what happens next."""
+        self.error_message.setText(reason)
+        self.error_banner.setVisible(True)
+        self.status_title.setText("Inference halted")
+        self.status_sub.setText("Waiting for you to continue, rerun, or stop.")
+        self.log.appendPlainText(f"\u26a0 HALTED: {reason}")
+
+    def _restart(self, *, overwrite: bool) -> None:
+        self.error_banner.setVisible(False)
+        datasets = getattr(self, "_last_datasets", None) or [
+            n for n, cb in self.dataset_checks.items() if cb.isChecked()
+        ]
+        max_q = getattr(self, "_last_max_q", None)
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.status_title.setText("Resuming\u2026" if not overwrite else "Restarting dataset\u2026")
+        self.status_sub.setText(f"{'Continuing' if not overwrite else 'Rerunning'} for {backend.model_label(self.model_tag)}")
+        self.worker = BenchmarkWorker(
+            self.model_tag, datasets,
+            max_questions=max_q, overwrite=overwrite,
+        )
+        self.worker.stage.connect(self._on_stage)
+        self.worker.request_progress.connect(self._on_progress)
+        self.worker.finished_ok.connect(self._on_finished)
+        self.worker.fatal_halt.connect(self._on_fatal_halt)
+        self.worker.start()
+
+    def _on_continue_after_halt(self) -> None:
+        # Resume: already-completed (success) requests are reused as-is by
+        # the engine, only the remaining/failed ones run again.
+        self._restart(overwrite=False)
+
+    def _on_rerun(self) -> None:
+        # Restart the selected datasets for this model from scratch.
+        self._restart(overwrite=True)
+
+    def _on_stop_after_halt(self) -> None:
+        self.error_banner.setVisible(False)
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.status_title.setText("Stopped")
+        self.status_sub.setText(
+            "Run stopped after a halted inference. Partial results are saved "
+            " - press Start to try again whenever you're ready."
+        )
+
     def _on_stage(self, stage: str, message: str, dataset, index: int, count: int) -> None:
         self.status_title.setText(message)
         if dataset:
             self.stat_dataset.set_value(str(dataset).replace("_", " ").title())
         self.log.appendPlainText(f"\u25b6 [{stage}] {message}")
+        # Remember where we are in the dataset list so _on_progress can
+        # blend in-dataset request progress into the overall bar instead of
+        # only advancing overall progress once an entire dataset finishes.
+        self._stage_index = index
+        self._stage_count = count
         if count:
             pct = int(index / count * 100)
             self.overall_bar.setValue(pct)
@@ -272,6 +478,20 @@ class RunScreen(QWidget):
         self.dataset_bar.setValue(pct)
         self.dataset_pct_lbl.setText(f"{pct}%")
 
+        # Blend this dataset's fractional completion into the overall bar so
+        # it advances continuously during inference, rather than staying
+        # frozen until the whole dataset finishes and only jumping between
+        # datasets (which is what made overall progress look "stuck").
+        count = getattr(self, "_stage_count", 0)
+        index = getattr(self, "_stage_index", 0)
+        if count:
+            overall_pct = int(((index + pct / 100.0) / count) * 100)
+            overall_pct = max(0, min(100, overall_pct))
+            self.overall_bar.setValue(overall_pct)
+            self.overall_pct_lbl.setText(
+                f"{overall_pct}%  \u00b7  dataset {min(index + 1, count)} of {count}"
+            )
+
         if status == "error":
             self.log.appendPlainText(f"  \u2715 error on {dataset} request {request_number}")
 
@@ -280,6 +500,10 @@ class RunScreen(QWidget):
         self.start_btn.setEnabled(True)
 
         if not success:
+            if self.error_banner.isVisible():
+                # The fatal_halt banner is already showing the real reason
+                # and the Continue/Rerun/Stop choices - don't stomp on it.
+                return
             self.status_title.setText("Run stopped")
             self.status_sub.setText(message or "Benchmark did not complete.")
             self.log.appendPlainText(f"\u26a0 {message}")

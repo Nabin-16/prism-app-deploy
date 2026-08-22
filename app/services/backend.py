@@ -5,7 +5,7 @@ This is the *only* place the GUI touches prism_core. It wraps the Qt-free
 engine (prism_core.ollama / prism_core.benchmark / prism_core.store) with:
 
   - a fixed on-disk location for the local run index + run outputs
-    (~/.prism/index.db, ~/.prism/runs/<run_id>/...) — the same SQLite file
+    (~/.prism/index.db, ~/.prism/runs/<run_id>/...) - the same SQLite file
     and JSON/CSV run artifacts can be committed to a repo, synced, or served
     by a companion website; nothing here is GUI-specific.
   - read helpers scoped to a single model (dataset-level metrics from the
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -26,7 +27,7 @@ from typing import Any, Optional
 
 from PySide6.QtCore import QThread, Signal
 
-from prism_core import config, ollama, store
+from prism_core import config, ollama, seed, store
 from prism_core import benchmark as core_benchmark
 from prism_core.benchmark import BenchmarkStage
 from app.services import supabase_sync
@@ -34,6 +35,18 @@ from app.services import supabase_sync
 APP_DIR = Path.home() / ".prism"
 DB_PATH = APP_DIR / "index.db"
 RUNS_ROOT = APP_DIR / "runs"
+
+
+def ensure_bundled_seed() -> list[str]:
+    """Populate the local index with the shipped results for all four
+    validated models the first time the app runs, so the dashboard has data
+    with no Ollama pull or inference needed. Safe to call on every launch - a no-op after the first time. Any model can still be re-run for real
+    from the Benchmark screen; that just adds a newer completed run."""
+    conn = get_conn()
+    try:
+        return seed.seed_bundled_results(conn, RUNS_ROOT)
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------
@@ -74,6 +87,70 @@ def model_label(model_tag: str) -> str:
     if meta:
         return meta["label"]
     return model_tag
+
+
+# --------------------------------------------------------------------------
+# RAM checks - advisory warning before pulling a model too big for this
+# device, never a hard block (the user can always choose to continue).
+# --------------------------------------------------------------------------
+
+_PARAM_COUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b(?![a-zA-Z])", re.IGNORECASE)
+
+
+def system_ram_gb() -> Optional[float]:
+    """Total physical RAM on this device, in GiB. Returns ``None`` if it
+    can't be determined (e.g. ``psutil`` isn't installed) - callers should
+    treat that as "unknown" and skip the warning rather than assume a
+    failure."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def estimate_model_ram_gb(model_tag: str) -> Optional[float]:
+    """Recommended RAM to run ``model_tag``, in GiB.
+
+    Uses the curated figure in :data:`config.MODELS` for the four
+    validated models. For any other tag (custom/cloud-saved models), it
+    falls back to parsing a parameter count out of the tag itself (e.g.
+    ``qwen2.5:14b`` -> 14) and estimates ~2x that in GB, which is the rule
+    of thumb Ollama itself uses for RAM sizing. Returns ``None`` when no
+    estimate can be made (e.g. a tag with no discernible parameter count),
+    in which case callers should skip the RAM check entirely rather than
+    warn on a guess.
+    """
+    meta = config.MODELS.get(model_tag)
+    if meta and "min_ram_gb" in meta:
+        return float(meta["min_ram_gb"])
+
+    match = _PARAM_COUNT_RE.search(model_tag)
+    if not match:
+        return None
+    try:
+        params_b = float(match.group(1))
+    except ValueError:
+        return None
+    if params_b <= 0:
+        return None
+    return max(4.0, round(params_b * 2))
+
+
+def check_ram_for_model(model_tag: str) -> Optional[tuple[float, float]]:
+    """Returns ``(required_gb, available_gb)`` if this device likely has
+    too little RAM to run ``model_tag``, or ``None`` if the model should be
+    fine (or there isn't enough information to say either way)."""
+    required = estimate_model_ram_gb(model_tag)
+    available = system_ram_gb()
+    if required is None or available is None:
+        return None
+    if available < required:
+        return required, available
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -195,7 +272,13 @@ def all_models_prompt_rows(conn: sqlite3.Connection) -> dict[str, list[dict[str,
 class PullWorker(QThread):
     """Downloads a model through Ollama, streaming progress."""
 
-    progress = Signal(str, int, int)   # status text, completed_bytes, total_bytes
+    # ``completed``/``total`` are raw byte counts from Ollama's pull
+    # progress stream - a model like Mistral-7B reports totals in the
+    # billions of bytes, which overflows a Qt-typed ``int`` signal
+    # (C++ int32, ~2.1B max) and crashes the pull with an OverflowError.
+    # Using ``float`` here has no such limit and loses no precision at
+    # these magnitudes.
+    progress = Signal(str, float, float)   # status text, completed_bytes, total_bytes
     finished_ok = Signal(bool, str)     # success, message
 
     def __init__(self, model_tag: str, parent=None) -> None:
@@ -209,12 +292,14 @@ class PullWorker(QThread):
     def run(self) -> None:
         def on_progress(p) -> None:
             if self._cancel.is_set():
-                return
-            self.progress.emit(p.status, int(p.completed or 0), int(p.total or 0))
+                raise ollama.PullCancelled()
+            self.progress.emit(p.status, float(p.completed or 0), float(p.total or 0))
 
         try:
             ollama.pull(self.model_tag, progress_callback=on_progress)
             self.finished_ok.emit(True, "")
+        except ollama.PullCancelled:
+            self.finished_ok.emit(False, "Cancelled")
         except ollama.OllamaError as exc:
             self.finished_ok.emit(False, str(exc))
 
@@ -254,6 +339,7 @@ class BenchmarkWorker(QThread):
     request_progress = Signal(str, str, int, int, float, float, object)
     # dataset, status, request_number, total, percent, avg_latency_seconds, eta_seconds
     finished_ok = Signal(bool, str, object)         # success, message, BenchmarkResult|None
+    fatal_halt = Signal(str)                        # halt_reason - inference paused, app kept alive
 
     def __init__(
         self,
@@ -274,7 +360,7 @@ class BenchmarkWorker(QThread):
         self.cancel_event.set()
 
     def run(self) -> None:
-        # sqlite3 connections can't cross threads — open our own here.
+        # sqlite3 connections can't cross threads - open our own here.
         conn = store.connect(DB_PATH)
 
         def on_stage(s: BenchmarkStage) -> None:
@@ -285,6 +371,13 @@ class BenchmarkWorker(QThread):
                 p.dataset, p.status, p.request_number, p.total,
                 p.percent, p.avg_latency_seconds or 0.0, p.eta_seconds,
             )
+
+        def on_fatal(reason: str) -> None:
+            # Called from inside the engine the instant a fatal condition
+            # (OOM, lost Ollama connection, a run of consecutive failures) is
+            # detected. Everything gathered so far is already saved to disk
+            # by the engine before this fires. This only notifies the GUI - # it never raises, so it can never crash this thread or the app.
+            self.fatal_halt.emit(reason)
 
         try:
             result = core_benchmark.run_benchmark(
@@ -297,12 +390,15 @@ class BenchmarkWorker(QThread):
                 stage_callback=on_stage,
                 progress_callback=on_progress,
                 cancel_event=self.cancel_event,
+                fatal_callback=on_fatal,
             )
             if result.cancelled:
                 self.finished_ok.emit(False, "Cancelled.", result)
+            elif result.halted:
+                self.finished_ok.emit(False, result.halt_reason or "Inference halted.", result)
             else:
                 self.finished_ok.emit(True, "", result)
-        except Exception as exc:  # noqa: BLE001 - surface any engine error to the GUI
+        except Exception as exc:  # noqa: BLE001 - surface any engine error to the GUI, never crash it
             self.finished_ok.emit(False, str(exc), None)
         finally:
             conn.close()

@@ -15,15 +15,15 @@ Design:
   - Uses the *anon* key only, sent as both apikey and Bearer token. This key
     is safe to ship hardcoded in a desktop app as long as Row Level Security
     policies on the `runs` / `run_results` tables restrict the anon role to
-    INSERT/UPSERT (see supabase/schema.sql) — it must never be able to read
+    INSERT/UPSERT (see supabase/schema.sql) - it must never be able to read
     other devices' data or perform destructive operations.
   - Upserts (`Prefer: resolution=merge-duplicates`) keyed on the same primary
     keys as the local schema, so re-running sync is idempotent and re-runs
     of a benchmark just overwrite the row.
-  - Never raises into the GUI thread's normal flow — callers get a
+  - Never raises into the GUI thread's normal flow - callers get a
     SyncResult with .ok / .message and decide what to show the user.
   - If SUPABASE_URL/SUPABASE_ANON_KEY are still the placeholder values in
-    config.py, sync is a no-op everywhere (is_configured() is False) — the
+    config.py, sync is a no-op everywhere (is_configured() is False) - the
     app works fully offline either way.
 """
 from __future__ import annotations
@@ -83,18 +83,17 @@ def test_connection() -> SyncResult:
     if resp.status_code == 200:
         return SyncResult(True, "Connected.")
     if resp.status_code in (401, 403):
-        return SyncResult(False, "Rejected — check the anon key and RLS policies.")
+        return SyncResult(False, "Rejected - check the anon key and RLS policies.")
     if resp.status_code == 404:
         return SyncResult(False, "Reached Supabase, but the `runs` table doesn't exist yet "
-                                  "— run supabase/schema.sql in the SQL editor first.")
+                                  " - run supabase/schema.sql in the SQL editor first.")
     return SyncResult(False, f"Unexpected response: {resp.status_code} {resp.text[:200]}")
 
 
 def _row_to_run_payload(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     # `datasets` is stored as a JSON string locally; Supabase column is jsonb,
-    # PostgREST accepts either a JSON-encoded string or a native object here —
-    # decode it so it lands as real jsonb rather than a quoted string.
+    # PostgREST accepts either a JSON-encoded string or a native object here - # decode it so it lands as real jsonb rather than a quoted string.
     try:
         d["datasets"] = json.loads(d["datasets"])
     except (TypeError, ValueError, KeyError):
@@ -114,8 +113,7 @@ _device_id_cache: str | None = None
 
 def _device_id() -> str:
     """A stable-ish per-install identifier so multiple people's local PRISM
-    installs can sync into the same Supabase project without colliding —
-    purely informational, not a security boundary."""
+    installs can sync into the same Supabase project without colliding - purely informational, not a security boundary."""
     global _device_id_cache
     if _device_id_cache is not None:
         return _device_id_cache
@@ -180,6 +178,58 @@ def sync_run(conn: sqlite3.Connection, benchmark_run_id: str) -> SyncResult:
         return SyncResult(False, "; ".join(errors), runs_synced=0,
                            results_synced=results_synced, errors=errors)
     return SyncResult(True, "Synced.", runs_synced=1, results_synced=results_synced)
+
+
+def fetch_custom_models() -> list[dict[str, Any]]:
+    """Return every "other model" any device has pulled and saved, newest
+    first. Best-effort: on any error (not configured, offline, table missing
+    because schema.sql hasn't been re-run yet) this just returns an empty
+    list rather than raising, since the startup screen's local catalog
+    always works without it.
+    """
+    if not is_configured():
+        return []
+    try:
+        resp = requests.get(
+            f"{config.SUPABASE_URL}/rest/v1/custom_models",
+            headers=_headers(),
+            params={"select": "model_tag,label,added_at", "order": "added_at.desc"},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        return []
+    if resp.status_code != 200:
+        return []
+    try:
+        return resp.json()
+    except ValueError:
+        return []
+
+
+def save_custom_model(model_tag: str, label: str | None = None) -> SyncResult:
+    """Upsert one "other model" tag so it's remembered next time the
+    startup screen's Manage Models panel opens, on this device or any other
+    device pointed at the same Supabase project."""
+    if not is_configured():
+        return SyncResult(False, "Supabase isn't configured.")
+    payload = {
+        "model_tag": model_tag,
+        "label": label or model_tag,
+        "device_id": _device_id(),
+    }
+    try:
+        resp = requests.post(
+            f"{config.SUPABASE_URL}/rest/v1/custom_models",
+            headers=_headers(upsert=True),
+            params={"on_conflict": "model_tag"},
+            data=json.dumps(payload),
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return SyncResult(False, f"Network error saving model: {exc}")
+    if resp.status_code in (200, 201, 204):
+        return SyncResult(True, "Saved.")
+    return SyncResult(False, f"custom_models upsert failed: {resp.status_code} {resp.text[:200]}")
 
 
 def sync_all_completed(conn: sqlite3.Connection) -> SyncResult:

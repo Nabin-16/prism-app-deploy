@@ -1,19 +1,19 @@
-"""OllamaService — the local inference layer.
+"""OllamaService - the local inference layer.
 
 Wraps the four Ollama HTTP endpoints the app needs, built on the configurable
 base URL (:func:`prism_core.config.ollama_url`) rather than a single hard-coded
 global:
 
-* ``/api/tags``     — is Ollama up, and which models are installed (+ digests)?
-* ``/api/show``     — details for one model.
-* ``/api/generate`` — the single-item inference primitive (ported verbatim from
+* ``/api/tags`` - is Ollama up, and which models are installed (+ digests)?
+* ``/api/show`` - details for one model.
+* ``/api/generate`` - the single-item inference primitive (ported verbatim from
   the research ``generate_with_ollama``: ``stream=False``, ``temperature`` and
   ``num_predict`` options, ``raise_for_status``, and a hard failure if the reply
   is not JSON or lacks a ``response`` field).
-* ``/api/pull``     — download a model, streaming NDJSON progress events.
+* ``/api/pull`` - download a model, streaming NDJSON progress events.
 
 Pure Python + ``requests``; no Qt. Callers that want progress pass a plain
-callback — the GUI worker adapts it to Qt signals.
+callback - the GUI worker adapts it to Qt signals.
 """
 from __future__ import annotations
 
@@ -29,6 +29,12 @@ from prism_core import config
 
 class OllamaError(RuntimeError):
     """Any failure talking to Ollama (transport, non-2xx, or malformed reply)."""
+
+
+class PullCancelled(Exception):
+    """Raised from a pull's ``progress_callback`` to stop the download
+    mid-stream (see :func:`pull`). Deliberately not an :class:`OllamaError`
+    subclass - a cancellation isn't a failure talking to Ollama."""
 
 
 @dataclass(frozen=True)
@@ -113,7 +119,7 @@ def model_digest(
 ) -> Optional[str]:
     """The content digest for an installed model, or None if not installed.
 
-    The digest — not the mutable ``mistral:7b`` tag — is what makes "same model"
+    The digest - not the mutable ``mistral:7b`` tag - is what makes "same model"
     precise in :func:`prism_core.fingerprint.config_fingerprint`.
     """
     model = find_model(model_name, base_url=base_url, timeout=timeout)
@@ -194,6 +200,10 @@ def pull(
 
     Raises :class:`OllamaError` if the stream reports an error. ``timeout`` is
     None by default because a pull can legitimately run for many minutes.
+    ``progress_callback`` may raise :class:`PullCancelled` to abort the
+    download mid-stream (e.g. in response to a user-requested cancel) - the
+    connection is closed and the exception propagates to the caller
+    unchanged.
     """
     try:
         with requests.post(

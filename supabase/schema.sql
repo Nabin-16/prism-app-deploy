@@ -42,8 +42,20 @@ create table if not exists public.run_results (
 create index if not exists idx_run_results_run on public.run_results(benchmark_run_id);
 create index if not exists idx_run_results_model on public.runs(model);
 
+-- "Other models" added from the startup screen's Manage Models panel. Any
+-- model tag a user pulls that isn't one of prism_core.config.MODELS' four
+-- validated models is upserted here, so it shows up in the picker on every
+-- device/run of the app instead of being forgotten after the session ends.
+create table if not exists public.custom_models (
+    model_tag   text primary key,
+    label       text,
+    device_id   text,
+    added_at    timestamptz not null default now()
+);
+
 alter table public.runs enable row level security;
 alter table public.run_results enable row level security;
+alter table public.custom_models enable row level security;
 
 -- The desktop app only ever uses the anon key. Lock it to insert/upsert only
 -- (no delete, no arbitrary reads of other people's rows if you're worried
@@ -78,3 +90,22 @@ create policy "anon can update own run_results (upsert)"
 -- CI with the service_role key.
 -- create policy "anon can read runs" on public.runs for select to anon using (true);
 -- create policy "anon can read run_results" on public.run_results for select to anon using (true);
+
+-- custom_models needs anon SELECT (unlike runs/run_results above) because
+-- the desktop app itself reads this list back on the startup screen to
+-- populate the "Other models on this project" section.
+create policy "anon can read custom models"
+    on public.custom_models for select
+    to anon
+    using (true);
+
+create policy "anon can insert custom models"
+    on public.custom_models for insert
+    to anon
+    with check (true);
+
+create policy "anon can update custom models (upsert)"
+    on public.custom_models for update
+    to anon
+    using (true)
+    with check (true);

@@ -1,4 +1,4 @@
-"""PRISM core — pure-Python benchmark engine (no Qt).
+"""PRISM core - pure-Python benchmark engine (no Qt).
 
 Houses the validated PRISM methodology (prompt rendering, response parsing,
 consistency scoring, reporting) together with the orchestration, Ollama

@@ -14,6 +14,19 @@ Writes:
     results/cloud/runs.json
     results/cloud/model_dataset_summary.csv   (flattened, one row per
                                                  model x dataset, latest run)
+    models/<model_tag>/summary.json           (one file per model, matching
+                                                 the public repo layout the
+                                                 README describes so the
+                                                 website/app can read a
+                                                 single model's result
+                                                 without downloading anything
+                                                 else)
+
+This script only ever reads from Supabase and writes files into the current
+checkout - it never pushes. Committing/pushing to the public results repo
+is done by the CI workflow that calls this script
+(.github/workflows/sync-results.yml), using a token scoped to that repo and
+held only in CI secrets, never in this codebase.
 """
 from __future__ import annotations
 
@@ -96,8 +109,31 @@ def main() -> int:
         for row in sorted(latest.values(), key=lambda r: (r["model"], r["dataset"])):
             writer.writerow(row)
 
+    # Per-model snapshot files, matching the public repo's /models/<name>/
+    # layout described in the project README - lets the website or a fresh
+    # app install fetch just one model's validated result.
+    models_dir = REPO_ROOT / "models"
+    by_model: dict[str, list[dict]] = {}
+    for row in latest.values():
+        by_model.setdefault(row["model"], []).append(row)
+    for model_tag, rows in by_model.items():
+        safe_name = model_tag.replace(":", "_").replace("/", "_")
+        model_dir = models_dir / safe_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model": model_tag,
+            "datasets": sorted(
+                ({k: v for k, v in r.items() if not k.startswith("_")} for r in rows),
+                key=lambda r: r["dataset"],
+            ),
+        }
+        (model_dir / "summary.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+
     print(f"Wrote {len(runs)} runs, {len(results)} result rows, "
-          f"{len(latest)} flattened model x dataset rows.")
+          f"{len(latest)} flattened model x dataset rows, "
+          f"{len(by_model)} per-model snapshot files.")
     return 0
 
 

@@ -1,4 +1,4 @@
-"""PRISM core configuration — the single typed source of truth.
+"""PRISM core configuration - the single typed source of truth.
 
 Ported from the research ``config.py``. The **methodology constants** (seed,
 sample size, prompt conditions, temperature, num_predict, protocol/template/
@@ -22,7 +22,15 @@ field with endpoint paths derived from it.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
+
+try:  # optional dependency - only needed to read a local .env in dev/packaging
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 # --- Reproducibility / sampling -------------------------------------------
 RANDOM_SEED: int = 2026
@@ -33,7 +41,7 @@ SAMPLE_SIZE_PER_DATASET: int = 200
 DATASET_VERSION: str = "1.0"
 
 # --- Dataset registry (HuggingFace source; used only by the dev refresh tool,
-# never at product runtime — the app ships frozen samples) ------------------
+# never at product runtime - the app ships frozen samples) ------------------
 DATASETS: dict[str, dict[str, Optional[str]]] = {
     "arc_challenge": {
         "huggingface_dataset": "allenai/ai2_arc",
@@ -47,7 +55,7 @@ DATASETS: dict[str, dict[str, Optional[str]]] = {
     },
 }
 
-# --- Prompt conditions (order matters — used for deterministic sorting) ----
+# --- Prompt conditions (order matters - used for deterministic sorting) ----
 PROMPT_CONDITIONS: tuple[str, ...] = ("P0", "P1", "P2", "P3", "P4")
 
 # --- Inference parameters --------------------------------------------------
@@ -64,11 +72,15 @@ OLLAMA_PULL_PATH: str = "/api/pull"
 
 # --- Validated models (highlighted in the UI; the app accepts any installed
 # Ollama model, these four are the research-validated set) ------------------
-MODELS: dict[str, dict[str, str]] = {
-    "llama3.2:3b": {"label": "Llama-3.2 (3B)"},
-    "gemma3:4b": {"label": "Gemma-3 (4B)"},
-    "phi4-mini:latest": {"label": "Phi-4-mini (3.8B)"},
-    "mistral:7b": {"label": "Mistral-7B"},
+# ``min_ram_gb`` is the RAM Ollama/the model runtime recommends to load and
+# run that model comfortably (roughly 2x the parameter count in GB, rounded
+# up to a common tier). It's advisory only - used to warn the user before a
+# pull that's unlikely to run well on their machine, never to hard-block it.
+MODELS: dict[str, dict[str, str | int]] = {
+    "llama3.2:3b": {"label": "Llama-3.2 (3B)", "min_ram_gb": 8},
+    "gemma3:4b": {"label": "Gemma-3 (4B)", "min_ram_gb": 8},
+    "phi4-mini:latest": {"label": "Phi-4-mini (3.8B)", "min_ram_gb": 8},
+    "mistral:7b": {"label": "Mistral-7B", "min_ram_gb": 16},
 }
 
 # --- Provenance identifiers ------------------------------------------------
@@ -77,13 +89,26 @@ TEMPLATE_VERSION: str = "1.0"
 PROTOCOL_VERSION: str = "1.0"
 
 # --- Cloud sync (Supabase) --------------------------------------------------
-# Hardcoded so every install of the app syncs into the same project without
-# any per-user setup. This MUST be the anon/public key only (Project
-# Settings -> API -> "anon public") — never the service_role key, since the
-# anon key is safe to ship in a client as long as supabase/schema.sql's RLS
-# policies restrict it to insert/upsert on runs + run_results.
-SUPABASE_URL: str = "https://memineeqsblrgyyjxtpa.supabase.co"   
-SUPABASE_ANON_KEY: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1lbWluZWVxc2Jscmd5eWp4dHBhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcxMzQzMDYsImV4cCI6MjEwMjcxMDMwNn0.Fh2OCKC_hpJ3qEPaKA-Gbemh-R5M_1Ib2kjSGJek3Jo"
+# Runtime sync (app/services/supabase_sync.py) always uses the *anon* key - # safe to ship in a client build as long as supabase/schema.sql's RLS
+# policies restrict the anon role to insert/upsert on runs + run_results.
+# Ported from Karuna's env-var convention: PRISM_SUPABASE_URL /
+# PRISM_SUPABASE_ANON_KEY (read from a local .env via python-dotenv, or from
+# the real environment in a packaged build) override the values below, so a
+# packaged executable doesn't need the project's keys baked into source.
+# The literals here are the fallback used when no environment/​.env value is
+# set (e.g. a source checkout with no .env configured yet).
+# No real project credentials are baked in here - set PRISM_SUPABASE_URL and
+# PRISM_SUPABASE_ANON_KEY as real environment variables (or in a local .env)
+# before packaging/running. Empty defaults mean sync is simply disabled
+# until configured, rather than silently pointing at someone else's project.
+SUPABASE_URL: str = os.environ.get("PRISM_SUPABASE_URL", "")
+SUPABASE_ANON_KEY: str = os.environ.get("PRISM_SUPABASE_ANON_KEY", "")
+
+# Admin-side push (scripts/push_bundled_results_to_supabase.py only - never
+# imported by the GUI). Mirrors Karuna's push_to_supabase.py: reads the
+# service_role key from the environment so it's never bundled into the
+# packaged executable at all.
+SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("PRISM_SUPABASE_SERVICE_ROLE_KEY", "")
 
 
 

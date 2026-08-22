@@ -1,4 +1,4 @@
-"""InferenceService — run every prompt condition for one dataset × model.
+"""InferenceService - run every prompt condition for one dataset × model.
 
 Ported from the research ``src/inference.py``, preserving the raw-record schema
 (``build_success_record`` / ``build_error_record``) and the rolling-latency ETA
@@ -11,13 +11,13 @@ exactly. Four deliberate product changes:
 2. **Any installed model.** ``model_label`` resolves via ``config.MODELS`` with a
    fallback to the raw tag, so a model outside the four validated ones does not
    ``KeyError`` (the research code assumed a known model).
-3. **Clean, atomic writes — the overwrite/duplication fix.** The research engine
+3. **Clean, atomic writes - the overwrite/duplication fix.** The research engine
    *appended* every record, so ``--overwrite`` (and interrupted reruns) could
    accrete duplicate lines and later break the scorer's join. Here the run holds
    exactly one record per ``(question_id, prompt_id)`` key in memory and writes
    the whole file with an atomic temp-file replace. Duplicates are impossible by
    construction. **Error records are still written** (``status="error"``) because
-   the parser turns them into observed ``UNKNOWN`` responses — dropping them would
+   the parser turns them into observed ``UNKNOWN`` responses - dropping them would
    silently change the methodology.
 4. **Qt-free progress + cancel.** Progress is reported through a plain
    :class:`InferenceProgress` callback and cancellation through a
@@ -40,6 +40,37 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from prism_core import config, ollama
+
+
+# --- fatal-condition detection ---------------------------------------------
+# Not every failed request is equal. A single bad response from the model
+# (refusal, malformed output, one dropped HTTP call) is expected and handled
+# as an ordinary "error" record - the parser treats it as an observed
+# UNKNOWN and the run keeps going. But some failures mean the *inference
+# backend itself* is in trouble (out of memory, Ollama process crashed/
+# unreachable) and grinding through the remaining requests would just
+# produce a wall of identical errors. Those are treated as fatal: the run
+# halts (never crashes the app) and hands control back to the UI so the
+# person can retry, continue, or stop.
+_FATAL_CONSECUTIVE_ERROR_THRESHOLD = 5
+
+
+def classify_error(exc: Exception) -> Optional[str]:
+    """Return a short human-readable fatal reason, or None if recoverable.
+
+    Recognizes out-of-memory conditions and total loss of contact with the
+    Ollama server. Anything else (timeouts, malformed responses, a single
+    refusal) is left as a normal per-request error.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if isinstance(exc, MemoryError) or "out of memory" in text or "oom" in text or "cuda out of memory" in text:
+        return "The system ran out of memory while running inference."
+    if isinstance(exc, ConnectionError) or "connection refused" in text or "connection reset" in text \
+            or "failed to establish a new connection" in text or "remote end closed connection" in text:
+        return "Lost connection to the Ollama server - it may have crashed or stopped."
+    if "model requires more system memory" in text or "requires more system memory" in text:
+        return "This model requires more memory than is available on this system."
+    return None
 
 
 # --- ported helpers --------------------------------------------------------
@@ -99,6 +130,8 @@ class InferenceResult:
     succeeded: int
     errored: int
     cancelled: bool
+    halted: bool = False
+    halt_reason: Optional[str] = None
 
     @property
     def resolved(self) -> int:
@@ -184,7 +217,7 @@ def build_error_record(
 def _atomic_write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     """Write all records to ``path`` via a temp file + atomic replace.
 
-    This is what guarantees at most one record per key on disk — the file is
+    This is what guarantees at most one record per key on disk - the file is
     rewritten wholesale from the in-memory result set, never appended to.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -250,6 +283,7 @@ def run_dataset_model(
     cancel_event: Optional[threading.Event] = None,
     generate_fn: Optional[Callable[..., tuple[str, float]]] = None,
     checkpoint_every: int = 50,
+    fatal_callback: Optional[Callable[[str], None]] = None,
 ) -> InferenceResult:
     """Run all prompt conditions for one dataset × model into ``raw_path``.
 
@@ -284,6 +318,9 @@ def run_dataset_model(
     done = reused
     executed = succeeded = errored = 0
     cancelled = False
+    halted = False
+    halt_reason: Optional[str] = None
+    consecutive_errors = 0
     latency_window: list[float] = []
     run_start = time.monotonic()
 
@@ -308,7 +345,7 @@ def run_dataset_model(
 
     for question_id, prompt_id, question, prompt in expected:
         key = (question_id, prompt_id)
-        if key in results:  # reused success — nothing to do
+        if key in results:  # reused success - nothing to do
             continue
         if cancel_event is not None and cancel_event.is_set():
             cancelled = True
@@ -343,7 +380,8 @@ def run_dataset_model(
             latency_window.append(latency)
             latency_window = latency_window[-20:]  # rolling window over last 20
             status = "success"
-        except Exception as exc:  # noqa: BLE001 — any failure becomes an error record
+            consecutive_errors = 0
+        except Exception as exc:  # noqa: BLE001 - any failure becomes an error record, never a crash
             error_message = str(exc)
             results[key] = build_error_record(
                 experiment_id=experiment_id,
@@ -357,6 +395,17 @@ def run_dataset_model(
             )
             errored += 1
             status = "error"
+            consecutive_errors += 1
+
+            fatal_reason = classify_error(exc)
+            if fatal_reason is None and consecutive_errors >= _FATAL_CONSECUTIVE_ERROR_THRESHOLD:
+                fatal_reason = (
+                    f"{consecutive_errors} inference requests in a row have failed - "
+                    "the model or Ollama server may be unresponsive."
+                )
+            if fatal_reason is not None:
+                halted = True
+                halt_reason = fatal_reason
 
         executed += 1
         done += 1
@@ -387,7 +436,20 @@ def run_dataset_model(
         if checkpoint_every and executed % checkpoint_every == 0:
             _atomic_write_jsonl(raw_path, _ordered_records(expected, results))
 
-    # Final durable write (also covers the cancelled / all-reused cases).
+        if halted:
+            # Save everything gathered so far immediately, then stop the loop.
+            # The app is never killed by this - it's a controlled halt so the
+            # UI can show what happened and let the person retry, continue
+            # from here, or stop for good.
+            _atomic_write_jsonl(raw_path, _ordered_records(expected, results))
+            if fatal_callback is not None:
+                try:
+                    fatal_callback(halt_reason or "Inference halted after a fatal error.")
+                except Exception:  # noqa: BLE001 - never let a UI callback crash the engine
+                    pass
+            break
+
+    # Final durable write (also covers the cancelled / all-reused / halted cases).
     _atomic_write_jsonl(raw_path, _ordered_records(expected, results))
 
     return InferenceResult(
@@ -400,4 +462,6 @@ def run_dataset_model(
         succeeded=succeeded,
         errored=errored,
         cancelled=cancelled,
+        halted=halted,
+        halt_reason=halt_reason,
     )

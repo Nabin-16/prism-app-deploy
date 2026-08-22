@@ -4,7 +4,7 @@ Ported from the research ``src/prompt_variations.py``. Loads the five frozen
 prompt templates (P0–P4) and renders them against frozen question samples. The
 template set, the required ``{question}``/``{option_a..d}`` placeholders, the
 SHA-256 identity of each template, and the exact rendering (``.format`` then
-``strip() + "\\n"``) are preserved so generated prompt text — and its hash — is
+``strip() + "\\n"``) are preserved so generated prompt text - and its hash - is
 identical to the validated pipeline.
 
 Differences from the research module (plumbing only): resource directories come

@@ -44,17 +44,57 @@ class SettingsScreen(QWidget):
         about = card("Card")
         bl = QVBoxLayout(about)
         bl.setContentsMargins(24, 22, 24, 22)
-        bl.setSpacing(6)
+        bl.setSpacing(10)
         bl.addWidget(h2("About PRISM"))
+
         bl.addWidget(body(
-            "PRISM benchmarks how reliably small language models answer the same "
-            "question when it's phrased in five different but equivalent ways, "
-            "running entirely against your local Ollama installation. The engine "
-            "(prism_core) is Qt-free and reusable outside this app; every run is "
-            "indexed locally at ~/.prism, and completed runs are mirrored to the "
-            "project's shared results automatically."
+            "<b>PRISM (Prompt Reliability Through Intelligent Semantic "
+            "Multiplexing)</b> is a benchmark and local desktop application "
+            "for evaluating how small, locally runnable language models "
+            "behave when the same question is presented through different, "
+            "semantically equivalent prompt formulations."
         ))
+        bl.addWidget(body(
+            "It was created to make prompt-dependent model behavior "
+            "directly observable and measurable rather than leaving it as "
+            "an assumption."
+        ))
+        bl.addWidget(body(
+            "PRISM sends the same question through several prompt "
+            "formulations, evaluates each response independently, and "
+            "reports where a model's behavior stayed stable and where it "
+            "did not."
+        ))
+        bl.addWidget(body(
+            "The desktop application performs benchmark execution locally, "
+            "while the public website provides documentation and access to "
+            "published benchmark results."
+        ))
+
+        what_card = card("CardRaised")
+        wl = QVBoxLayout(what_card)
+        wl.setContentsMargins(16, 14, 16, 14)
+        wl.setSpacing(6)
+        wl.addWidget(h2("What PRISM does"))
+        wl.addWidget(body(
+            "1. Presents the same underlying question through <b>five "
+            "distinct prompt formulations</b>."
+        ))
+        wl.addWidget(body(
+            "2. Evaluates each response independently for <b>correctness, "
+            "instruction compliance, and answer recoverability</b>."
+        ))
+        wl.addWidget(body(
+            "3. Reports where a model's behavior <b>stayed stable</b> and "
+            "where it <b>did not</b> across those formulations."
+        ))
+        bl.addWidget(what_card)
+
         bl.addWidget(faint("Protocol 1.0 · Templates 1.0 · Local-only inference · Temperature 0"))
+        bl.addWidget(faint(
+            "This project is developed as part of a 6th semester computer "
+            "engineering curriculum."
+        ))
 
         data_row = QHBoxLayout()
         data_row.addWidget(faint("Local data lives at:"))

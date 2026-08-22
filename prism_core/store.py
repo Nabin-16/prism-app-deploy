@@ -2,14 +2,14 @@
 
 This is an **index, not a blob store** (plan §"Local store"): the heavy
 artifacts stay as JSONL/CSV under ``runs/<id>/``. The DB records which runs
-exist and — crucially — the per-(model, dataset) ``config_fingerprint`` so the
+exist and - crucially - the per-(model, dataset) ``config_fingerprint`` so the
 run-setup screen can answer *"is there already a local result equivalent to what
 you're about to run?"* without re-reading every run's files.
 
 Two tables:
 
-* ``runs``        — one row per :func:`prism_core.fingerprint.new_benchmark_run_id`.
-* ``run_results`` — one row per (run, dataset) with the fingerprint and the
+* ``runs`` - one row per :func:`prism_core.fingerprint.new_benchmark_run_id`.
+* ``run_results`` - one row per (run, dataset) with the fingerprint and the
   headline model/dataset-level metrics for fast listing.
 """
 from __future__ import annotations

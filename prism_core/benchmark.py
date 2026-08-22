@@ -1,4 +1,4 @@
-"""BenchmarkService — the end-to-end orchestrator.
+"""BenchmarkService - the end-to-end orchestrator.
 
 Sequences the validated pipeline for one model over one or more datasets:
 
@@ -14,9 +14,9 @@ It is deliberately decoupled from both the network and the GUI:
 * ``generate_fn`` (default :func:`prism_core.ollama.generate`) and
   ``model_digest`` are injectable, so the whole pipeline runs headless with a
   mock Ollama and no sockets.
-* progress is reported through plain callbacks — ``progress_callback`` (per
+* progress is reported through plain callbacks - ``progress_callback`` (per
   request, forwarded to inference) and ``stage_callback`` (coarse stage
-  transitions) — which the GUI worker turns into Qt signals.
+  transitions) - which the GUI worker turns into Qt signals.
 
 Cancellation is cooperative via a :class:`threading.Event`: if inference reports
 a cancelled dataset the orchestrator stops, marks the run ``cancelled``, and
@@ -87,9 +87,11 @@ class BenchmarkResult:
     datasets: list[str]
     run_dir: Path
     summary_json_path: Path
-    status: str                  # "completed" | "cancelled"
+    status: str                  # "completed" | "cancelled" | "halted"
     cancelled: bool
-    outcomes: list[DatasetOutcome]
+    halted: bool = False
+    halt_reason: Optional[str] = None
+    outcomes: list[DatasetOutcome] = None  # type: ignore[assignment]
 
 
 def _emit_stage(
@@ -151,6 +153,7 @@ def run_benchmark(
     progress_callback: Optional[Callable[[InferenceProgress], None]] = None,
     stage_callback: Optional[Callable[[BenchmarkStage], None]] = None,
     cancel_event: Optional[threading.Event] = None,
+    fatal_callback: Optional[Callable[[str], None]] = None,
 ) -> BenchmarkResult:
     """Run the full PRISM benchmark for one model over ``datasets``.
 
@@ -218,6 +221,8 @@ def run_benchmark(
     outcomes: list[DatasetOutcome] = []
     all_metrics: list[dict[str, Any]] = []
     cancelled = False
+    halted = False
+    halt_reason: Optional[str] = None
 
     for index, dataset in enumerate(dataset_list):
         doc = docs[dataset]
@@ -244,9 +249,33 @@ def run_benchmark(
             progress_callback=progress_callback,
             cancel_event=cancel_event,
             generate_fn=generate_fn,
+            fatal_callback=fatal_callback,
         )
         if inf.cancelled:
             cancelled = True
+            break
+        if inf.halted:
+            # A fatal condition (OOM, lost connection, etc.) stopped inference
+            # partway through this dataset. Whatever was gathered is already
+            # saved to disk (see inference.run_dataset_model), but there isn't
+            # a complete response set to parse/score for this dataset yet, so
+            # skip straight to writing a partial summary and stopping - the
+            # app itself keeps running and the person can retry or continue.
+            halted = True
+            halt_reason = inf.halt_reason
+            outcomes.append(
+                DatasetOutcome(
+                    dataset=dataset,
+                    config_fingerprint="",
+                    question_count=counts[dataset],
+                    inference=inf,
+                    parsed_processed=0,
+                    parsed_malformed=0,
+                    scored_path=paths.scored_dir / f"{dataset}__{model_name.replace(':', '_')}.jsonl",
+                    question_metrics_path=paths.summary_dir / f"{dataset}__{model_name.replace(':', '_')}.jsonl",
+                    summary={},
+                )
+            )
             break
 
         # --- parse ---------------------------------------------------------
@@ -315,7 +344,7 @@ def run_benchmark(
         )
 
     # --- combined report over all completed datasets ----------------------
-    status = "cancelled" if cancelled else "completed"
+    status = "halted" if halted else ("cancelled" if cancelled else "completed")
     _emit_stage(
         stage_callback, benchmark_run_id=run_id, stage="report",
         message="Building summary report", dataset=None,
@@ -336,6 +365,7 @@ def run_benchmark(
         "created_utc": created_utc,
         "finished_utc": finished_utc,
         "status": status,
+        "halt_reason": halt_reason,
         "app_version": APP_VERSION,
         "protocol_version": config.PROTOCOL_VERSION,
         "experiment_id": experiment_id,
@@ -399,5 +429,7 @@ def run_benchmark(
         summary_json_path=paths.summary_json,
         status=status,
         cancelled=cancelled,
+        halted=halted,
+        halt_reason=halt_reason,
         outcomes=outcomes,
     )

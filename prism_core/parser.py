@@ -2,7 +2,7 @@
 
 Ported verbatim from the research ``src/response_parser.py``. Converts a
 free-form model response into a standardized answer plus a parse status and an
-instruction-compliance flag, doing *safe* extraction — it deliberately does not
+instruction-compliance flag, doing *safe* extraction - it deliberately does not
 grab the first A/B/C/D it sees in reasoning text, and it honors explicit
 final-answer declarations, revisions, refusals, and ambiguity.
 

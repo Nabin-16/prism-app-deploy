@@ -1,5 +1,5 @@
 """
-Small persisted app-state file (selected model, theme) — separate from the
+Small persisted app-state file (selected model, theme) - separate from the
 prism_core run index (SQLite) because it's UI state, not benchmark data.
 Lives at ~/.prism/app_state.json next to the run index and run outputs.
 """
@@ -14,7 +14,7 @@ STATE_PATH = APP_DIR / "app_state.json"
 
 _DEFAULTS: dict[str, Any] = {
     "selected_model": None,
-    "theme": "dusk",
+    "theme": "paper",
 }
 
 
@@ -46,7 +46,7 @@ def set_selected_model(model_tag: str | None) -> None:
 
 
 def get_theme() -> str:
-    return _read().get("theme", "dusk")
+    return _read().get("theme", "paper")
 
 
 def set_theme(theme: str) -> None:

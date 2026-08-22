@@ -2,28 +2,43 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QFrame, QScrollArea, QLineEdit, QProgressBar,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QLineEdit, QProgressBar, QMessageBox,
 )
 
-from app.gui.widgets import pill
-from app.services import backend, app_state
+from app.gui.widgets import pill, card, h2, body, faint, SectionHeader, centered_column
+from app.services import backend, app_state, supabase_sync
 from app.services.backend import PullWorker
 
 
 class ModelRow(QFrame):
+    """One row in the model list. The row itself *is* the selector - click
+    anywhere on it (outside the pull button) to make it the active model.
+    A selected row gets an accent-colored fill; the pull button still does
+    its own separate job of downloading the model."""
+
     pull_requested = Signal(str)
+    stop_requested = Signal(str)
+    selected = Signal(str)
 
     def __init__(self, model_tag: str, label: str, parent=None):
         super().__init__(parent)
         self.model_tag = model_tag
-        self.setObjectName("CardFlat")
+        self.setObjectName("ModelListRow")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._selected = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 12)
         root.setSpacing(8)
 
         top = QHBoxLayout()
+        top.setSpacing(10)
+
+        self.star_lbl = QLabel("\u2606")
+        self.star_lbl.setObjectName("ModelRowStar")
+        top.addWidget(self.star_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+
         text_col = QVBoxLayout()
         text_col.setSpacing(1)
         name_lbl = QLabel(label)
@@ -41,8 +56,16 @@ class ModelRow(QFrame):
         self.action_btn = QPushButton("Pull model")
         self.action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.action_btn.setFixedWidth(110)
-        self.action_btn.clicked.connect(lambda: self.pull_requested.emit(self.model_tag))
+        self.action_btn.clicked.connect(self._on_pull_clicked)
         top.addWidget(self.action_btn)
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("Danger")
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_btn.setFixedWidth(70)
+        self.stop_btn.setVisible(False)
+        self.stop_btn.clicked.connect(lambda: self.stop_requested.emit(self.model_tag))
+        top.addWidget(self.stop_btn)
 
         root.addLayout(top)
 
@@ -57,7 +80,26 @@ class ModelRow(QFrame):
         self.progress_label.setVisible(False)
         root.addWidget(self.progress_label)
 
+    def _on_pull_clicked(self) -> None:
+        # Pulling a model doesn't itself change the selection, so this is
+        # kept separate from mousePressEvent's row-click selection.
+        self.pull_requested.emit(self.model_tag)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        if self.action_btn.geometry().contains(event.pos()) or self.stop_btn.geometry().contains(event.pos()):
+            super().mousePressEvent(event)
+            return
+        self.selected.emit(self.model_tag)
+        super().mousePressEvent(event)
+
+    def set_selected(self, is_selected: bool) -> None:
+        self._selected = is_selected
+        self.setProperty("selected", "true" if is_selected else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
     def set_installed(self, installed: bool) -> None:
+        self.star_lbl.setText("\u2605" if installed else "\u2606")
         if installed:
             self.status_pill.setText("INSTALLED")
             self.status_pill.setStyleSheet("background: rgba(95,209,142,0.15); color:#5fd18e;")
@@ -67,24 +109,27 @@ class ModelRow(QFrame):
             self.status_pill.setStyleSheet("background: rgba(232,180,92,0.15); color:#e8b45c;")
             self.action_btn.setText("Pull model")
         self.action_btn.setEnabled(True)
+        self.action_btn.setVisible(True)
+        self.stop_btn.setVisible(False)
 
     def set_pulling(self, active: bool) -> None:
-        self.action_btn.setEnabled(not active)
-        self.action_btn.setText("Pulling\u2026" if active else self.action_btn.text())
+        self.action_btn.setVisible(not active)
+        self.stop_btn.setVisible(active)
+        self.stop_btn.setEnabled(active)
         self.progress.setVisible(active)
         self.progress_label.setVisible(active)
         if active:
             self.status_pill.setText("DOWNLOADING")
             self.status_pill.setStyleSheet("background: rgba(143,124,242,0.18); color:#8f7cf2;")
 
-    def update_progress(self, status: str, completed: int, total: int) -> None:
+    def update_progress(self, status: str, completed: float, total: float) -> None:
         if total > 0:
             pct = int(completed / total * 100)
             self.progress.setRange(0, 100)
             self.progress.setValue(pct)
             mb_done = completed / (1024 * 1024)
             mb_total = total / (1024 * 1024)
-            self.progress_label.setText(f"{status} \u2014 {mb_done:,.0f} / {mb_total:,.0f} MB")
+            self.progress_label.setText(f"{status} - {mb_done:,.0f} / {mb_total:,.0f} MB")
         else:
             self.progress.setRange(0, 0)
             self.progress_label.setText(status)
@@ -92,10 +137,10 @@ class ModelRow(QFrame):
 
 class StartupScreen(QWidget):
     """
-    First thing the user sees: a centered card that (1) checks the local
-    Ollama daemon, then (2) lets the user pick — or pull — the single model
-    that becomes the app's *active model* for both the benchmark run and the
-    dashboard. A "Manage models" panel exposes pulling any other model.
+    Setup screen: a full-width page (matching the rest of the app's
+    Settings-style screens) with an Ollama connection status card up top
+    and a "Model Selection" card below it containing the model list, the
+    "add another model" field, and the continue action.
     """
 
     model_chosen = Signal(str)
@@ -105,165 +150,153 @@ class StartupScreen(QWidget):
         super().__init__(parent)
         self.pull_workers: dict[str, PullWorker] = {}
         self.model_rows: dict[str, ModelRow] = {}
+        self.selected_model_tag: str | None = None
+        # Set while a pull was kicked off from the "Continue" button, so
+        # that a *successful* pull automatically advances into the app
+        # instead of leaving the user stranded on this screen.
+        self._auto_continue_tag: str | None = None
         self.setObjectName("StartupRoot")
+        self._existing_results = False
+        self._connected = False
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(28, 24, 28, 24)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        brand_row = QHBoxLayout()
-        brand = QLabel("PRISM")
-        brand.setObjectName("BrandMark")
-        brand_row.addWidget(brand)
-        brand_row.addStretch(1)
-        outer.addLayout(brand_row)
+        # Centered, width-capped content column (same pattern as the
+        # Benchmark screen) so the page reads as a focused setup panel
+        # instead of stretching full-bleed across a wide window.
+        content = QWidget()
+        root.addWidget(content)
+        inner = centered_column(content, max_width=760, margins=(28, 36, 28, 36), spacing=22)
 
-        outer.addStretch(1)
+        inner.addWidget(SectionHeader(
+            "Setup Benchmark",
+        ))
 
-        center_row = QHBoxLayout()
-        center_row.setSpacing(28)
-        center_row.addStretch(1)
+        # ---- Ollama connection status card ----
+        conn_card = card("CardFlat")
+        conn_lay = QVBoxLayout(conn_card)
+        conn_lay.setContentsMargins(20, 16, 20, 16)
+        conn_lay.setSpacing(6)
 
-        self.card = QFrame()
-        self.card.setObjectName("StartupCard")
-        self.card.setFixedWidth(420)
-        card_lay = QVBoxLayout(self.card)
-        card_lay.setContentsMargins(0, 0, 0, 0)
-        card_lay.setSpacing(18)
-
-        self.title = QLabel("Connecting to Ollama")
-        self.title.setObjectName("StartupTitle")
-        card_lay.addWidget(self.title)
-
-        self.subtitle = QLabel("Checking localhost:11434 for a running Ollama instance\u2026")
-        self.subtitle.setObjectName("StartupSubtitle")
-        self.subtitle.setWordWrap(True)
-        card_lay.addWidget(self.subtitle)
-
-        self.status_row = QHBoxLayout()
+        conn_top = QHBoxLayout()
+        conn_top.setSpacing(10)
         self.status_dot = QLabel("\u25cf")
         self.status_dot.setObjectName("StatusDotPending")
-        self.status_text = QLabel("Searching\u2026")
-        self.status_text.setObjectName("StartupStatusText")
-        self.status_row.addWidget(self.status_dot)
-        self.status_row.addWidget(self.status_text)
-        self.status_row.addStretch(1)
-        card_lay.addLayout(self.status_row)
+        conn_top.addWidget(self.status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        ollama_lbl = QLabel("Ollama")
+        ollama_lbl.setObjectName("H2")
+        conn_top.addWidget(ollama_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.status_pill = pill("CHECKING\u2026", "#9c99a8", "transparent")
+        conn_top.addWidget(self.status_pill, 0, Qt.AlignmentFlag.AlignVCenter)
+        conn_top.addStretch(1)
+        self.refresh_btn = QPushButton("Refresh Status")
+        self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_btn.clicked.connect(self._check_ollama)
+        conn_top.addWidget(self.refresh_btn)
+        conn_lay.addLayout(conn_top)
 
-        self.model_label = QLabel("Model")
-        self.model_label.setObjectName("FieldLabel")
-        self.model_label.setVisible(False)
-        card_lay.addWidget(self.model_label)
+        self.status_detail = faint("Checking localhost:11434 for a running Ollama instance\u2026")
+        conn_lay.addWidget(self.status_detail)
 
-        self.model_combo = QComboBox()
-        self.model_combo.setObjectName("StartupCombo")
-        self.model_combo.setVisible(False)
-        self.model_combo.setFixedHeight(42)
-        card_lay.addWidget(self.model_combo)
+        inner.addWidget(conn_card)
 
-        self.model_hint = QLabel("")
-        self.model_hint.setObjectName("StartupSubtitle")
-        self.model_hint.setWordWrap(True)
-        self.model_hint.setVisible(False)
-        card_lay.addWidget(self.model_hint)
+        # ---- Model Selection card ----
+        sel_label = QLabel("Model Selection")
+        sel_label.setObjectName("SectionLabel")
+        inner.addWidget(sel_label)
 
-        self.primary_btn = QPushButton("Retry connection")
-        self.primary_btn.setObjectName("StartupPrimaryBtn")
-        self.primary_btn.setFixedHeight(42)
-        self.primary_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.primary_btn.clicked.connect(self._on_primary_clicked)
-        card_lay.addWidget(self.primary_btn)
+        sel_card = card("CardFlat")
+        sel_lay = QVBoxLayout(sel_card)
+        sel_lay.setContentsMargins(20, 18, 20, 18)
+        sel_lay.setSpacing(14)
 
-        self.manage_link = QPushButton("Manage models  \u21b4")
-        self.manage_link.setObjectName("StartupSkipLink")
-        self.manage_link.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.manage_link.setFlat(True)
-        self.manage_link.setVisible(False)
-        self.manage_link.clicked.connect(self._toggle_models_panel)
-        card_lay.addWidget(self.manage_link)
+        sel_lay.addWidget(body(
+            "Select an installed model to benchmark, or add another model from Ollama."
+        ))
 
-        self.install_hint = QLabel(
-            "Don't have Ollama? Install it from ollama.com, run "
-            "`ollama serve`, then retry."
-        )
-        self.install_hint.setObjectName("StartupFootnote")
-        self.install_hint.setWordWrap(True)
-        card_lay.addWidget(self.install_hint)
-
-        self.skip_link = QPushButton("Existing results found \u2014 skip to dashboard  \u2192")
-        self.skip_link.setObjectName("StartupSkipLink")
-        self.skip_link.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.skip_link.setFlat(True)
-        self.skip_link.setVisible(False)
-        self.skip_link.clicked.connect(self.skip_to_dashboard.emit)
-        card_lay.addWidget(self.skip_link)
-
-        self._existing_results = False
-        center_row.addWidget(self.card)
-
-        # ---- models management panel ----
-        self.models_panel = QFrame()
-        self.models_panel.setObjectName("StartupModelsPanel")
-        self.models_panel.setFixedWidth(380)
-        self.models_panel.setVisible(False)
-        panel_lay = QVBoxLayout(self.models_panel)
-        panel_lay.setContentsMargins(20, 20, 20, 20)
-        panel_lay.setSpacing(10)
-
-        panel_title = QLabel("Manage models")
-        panel_title.setObjectName("H2")
-        panel_lay.addWidget(panel_title)
-        panel_sub = QLabel(
-            "Pull any model straight into your local Ollama install. Installed "
-            "models are detected automatically and appear in the picker on the left."
-        )
-        panel_sub.setObjectName("StartupSubtitle")
-        panel_sub.setWordWrap(True)
-        panel_lay.addWidget(panel_sub)
-
-        custom_row = QHBoxLayout()
-        self.custom_model_input = QLineEdit()
-        self.custom_model_input.setObjectName("StartupCombo")
-        self.custom_model_input.setPlaceholderText("e.g. qwen2.5:7b")
-        self.custom_model_input.setFixedHeight(38)
-        custom_row.addWidget(self.custom_model_input, 1)
-        self.custom_pull_btn = QPushButton("Pull")
-        self.custom_pull_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.custom_pull_btn.setFixedHeight(38)
-        self.custom_pull_btn.clicked.connect(self._pull_custom_model)
-        custom_row.addWidget(self.custom_pull_btn)
-        panel_lay.addLayout(custom_row)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setMaximumHeight(360)
-        rows_host = QWidget()
-        self.rows_lay = QVBoxLayout(rows_host)
-        self.rows_lay.setContentsMargins(0, 4, 0, 4)
+        # ---- model rows - laid out directly (no scroll) so all four
+        # validated models are visible at once without scrolling; any
+        # custom/cloud-saved tags added later simply grow the card. ----
+        self.rows_host = QWidget()
+        self.rows_lay = QVBoxLayout(self.rows_host)
+        self.rows_lay.setContentsMargins(0, 0, 0, 0)
         self.rows_lay.setSpacing(8)
 
         for tag, meta in backend.models_catalog().items():
             row = ModelRow(tag, meta["label"])
             row.pull_requested.connect(self._start_pull)
+            row.stop_requested.connect(self._stop_pull)
+            row.selected.connect(self._select_model)
             self.model_rows[tag] = row
             self.rows_lay.addWidget(row)
-        self.rows_lay.addStretch(1)
 
-        scroll.setWidget(rows_host)
-        panel_lay.addWidget(scroll)
+        sel_lay.addWidget(self.rows_host)
 
-        self.device_label = QLabel("")
-        self.device_label.setObjectName("StartupFootnote")
-        self.device_label.setWordWrap(True)
-        panel_lay.addWidget(self.device_label)
+        # ---- "Add other models" - a labeled input row so pulling
+        # something outside the four validated models reads as one simple
+        # action (type a tag, hit the button). Anything pulled here is
+        # also saved to Supabase (see supabase_sync.save_custom_model) so
+        # it's remembered on the next launch and on any other device
+        # synced to the same project.
+        custom_row = QHBoxLayout()
+        custom_row.setSpacing(8)
+        self.custom_model_input = QLineEdit()
+        self.custom_model_input.setObjectName("StartupCombo")
+        self.custom_model_input.setPlaceholderText("Enter Ollama model tag, e.g. qwen2.5:3b")
+        self.custom_model_input.setFixedHeight(40)
+        self.custom_model_input.returnPressed.connect(self._pull_custom_model)
+        custom_row.addWidget(self.custom_model_input, 1)
+        self.custom_pull_btn = QPushButton("Add Model")
+        self.custom_pull_btn.setObjectName("Primary")
+        self.custom_pull_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.custom_pull_btn.setFixedHeight(40)
+        self.custom_pull_btn.clicked.connect(self._pull_custom_model)
+        custom_row.addWidget(self.custom_pull_btn)
+        sel_lay.addLayout(custom_row)
 
-        center_row.addWidget(self.models_panel)
-        center_row.addStretch(1)
-        outer.addLayout(center_row)
-        outer.addStretch(2)
+        add_sub = faint(
+            "Note: Enter the exact model tag from the Ollama library. If not "
+            "installed, it will be prepared automatically."
+        )
+        sel_lay.addWidget(add_sub)
 
-        self._connected = False
-        self._models_panel_open = False
+        self.device_label = faint("")
+        sel_lay.addWidget(self.device_label)
+
+        # Shown as soon as a too-big-for-this-device model is selected,
+        # *before* the user tries to pull or continue - an up-front heads
+        # up rather than a surprise at click time.
+        self.ram_warning_label = QLabel("")
+        self.ram_warning_label.setObjectName("Faint")
+        self.ram_warning_label.setStyleSheet("color:#ea6b6b;")
+        self.ram_warning_label.setWordWrap(True)
+        self.ram_warning_label.setVisible(False)
+        sel_lay.addWidget(self.ram_warning_label)
+
+        self.continue_btn = QPushButton("Select a model")
+        self.continue_btn.setObjectName("StartupPrimaryBtnReady")
+        self.continue_btn.setFixedHeight(48)
+        self.continue_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.continue_btn.setEnabled(False)
+        self.continue_btn.clicked.connect(self._on_continue_clicked)
+        sel_lay.addWidget(self.continue_btn)
+
+        inner.addWidget(sel_card)
+
+        # ---- "existing results" skip link - the very last thing on the
+        # screen, below the model selection card. ----
+        self.skip_link = QPushButton(" Skip to dashboard  \u2192")
+        self.skip_link.setObjectName("StartupSkipLink")
+        self.skip_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.skip_link.setFlat(True)
+        self.skip_link.setVisible(False)
+        inner.addWidget(self.skip_link, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.skip_link.clicked.connect(self.skip_to_dashboard.emit)
+
+        inner.addStretch(1)
+
         QTimer.singleShot(250, self._check_ollama)
 
     # ---------------- logic ----------------
@@ -273,34 +306,31 @@ class StartupScreen(QWidget):
         self.skip_link.setVisible(available)
 
     def _check_ollama(self) -> None:
-        self.title.setText("Connecting to Ollama")
-        self.subtitle.setText("Checking localhost:11434 for a running Ollama instance\u2026")
         self.status_dot.setObjectName("StatusDotPending")
-        self.status_text.setText("Searching\u2026")
         self._refresh_dot_style()
+        self.status_pill.setText("CHECKING\u2026")
+        self.status_pill.setStyleSheet("background: rgba(156,153,168,0.15); color:#9c99a8;")
+        self.status_detail.setText("Checking localhost:11434 for a running Ollama instance\u2026")
 
         reachable = backend.ollama_available()
         if reachable:
             self._connected = True
             self.status_dot.setObjectName("StatusDotGood")
-            self.status_text.setText("Connected")
             self._refresh_dot_style()
+            self.status_pill.setText("CONNECTED")
+            self.status_pill.setStyleSheet("background: rgba(95,209,142,0.15); color:#5fd18e;")
             self._show_model_picker()
-            self.manage_link.setVisible(True)
-            self._refresh_model_rows()
         else:
             self._connected = False
             self.status_dot.setObjectName("StatusDotBad")
-            self.status_text.setText("Not found")
             self._refresh_dot_style()
-            self.title.setText("Ollama not detected")
-            self.subtitle.setText(
-                "PRISM benchmarks run locally against Ollama. Start it, then retry."
+            self.status_pill.setText("NOT FOUND")
+            self.status_pill.setStyleSheet("background: rgba(234,107,107,0.15); color:#ea6b6b;")
+            self.status_detail.setText(
+                "Ollama isn't reachable at localhost:11434. Install it from "
+                "ollama.com, run `ollama serve`, then refresh status."
             )
-            self.primary_btn.setText("Retry connection")
-            self.install_hint.setVisible(True)
-            self.manage_link.setVisible(False)
-            self.models_panel.setVisible(False)
+            self._update_continue_btn()
 
     def _refresh_dot_style(self) -> None:
         colors = {
@@ -312,92 +342,159 @@ class StartupScreen(QWidget):
         self.status_dot.setStyleSheet(f"color:{colors.get(name, '#9c99a8')}; font-size:11px;")
 
     def _show_model_picker(self) -> None:
-        self.title.setText("Select a model")
-        self.subtitle.setText(
-            "Pick the model PRISM will benchmark and show on the dashboard. "
-            "Models already pulled are marked ready; others download through "
-            "Ollama when you continue."
-        )
-        self.install_hint.setVisible(False)
-
-        installed = backend.installed_model_tags()
-        self.model_combo.clear()
-        for tag, meta in backend.models_catalog().items():
-            ready = tag in installed or tag.split(":")[0] in installed
-            label = f"{meta['label']}  \u2014  {'ready' if ready else 'will download'}"
-            self.model_combo.addItem(label, userData=tag)
+        self._load_cloud_models()
+        self._refresh_model_rows()
 
         remembered = app_state.get_selected_model()
-        if remembered:
-            idx = self.model_combo.findData(remembered)
-            if idx >= 0:
-                self.model_combo.setCurrentIndex(idx)
-
-        self.model_label.setVisible(True)
-        self.model_combo.setVisible(True)
-        self.model_hint.setVisible(True)
-        self._update_model_hint()
-        self.model_combo.currentIndexChanged.connect(lambda _i: self._update_model_hint())
-
-        self.primary_btn.setText("Continue  \u2192")
-        self.primary_btn.setObjectName("StartupPrimaryBtnReady")
-        self.primary_btn.setStyleSheet("")
-
-    def _update_model_hint(self) -> None:
-        tag = self.model_combo.currentData()
-        if not tag:
-            return
-        installed = backend.installed_model_tags()
-        ready = tag in installed or tag.split(":")[0] in installed
-        if ready:
-            self.model_hint.setText(f"\u201c{tag}\u201d is already pulled \u2014 inference can start immediately.")
+        if remembered and remembered in self.model_rows:
+            self._select_model(remembered)
+        elif self.model_rows and self.selected_model_tag is None:
+            self._select_model(next(iter(self.model_rows)))
         else:
-            self.model_hint.setText(f"\u201c{tag}\u201d isn't pulled yet \u2014 PRISM will download it first (progress shown on the next screen).")
+            self._update_continue_btn()
 
-    def _on_primary_clicked(self) -> None:
-        if not self._connected:
-            self._check_ollama()
+    def _select_model(self, tag: str) -> None:
+        if tag not in self.model_rows:
             return
-        tag = self.model_combo.currentData()
-        if tag:
-            app_state.set_selected_model(tag)
-            self.model_chosen.emit(tag)
+        self.selected_model_tag = tag
+        for row_tag, row in self.model_rows.items():
+            row.set_selected(row_tag == tag)
+        self._update_ram_warning(tag)
+        self._update_continue_btn()
 
-    # ---------------- manage-models panel ----------------
-
-    def _toggle_models_panel(self) -> None:
-        self._models_panel_open = not self._models_panel_open
-        self.models_panel.setVisible(self._models_panel_open)
-        self.manage_link.setText(
-            "Manage models  \u2191" if self._models_panel_open else "Manage models  \u21b4"
+    def _update_ram_warning(self, tag: str) -> None:
+        """Surface an insufficient-RAM warning inline, right away, as soon
+        as a model is picked - before the user ever clicks Pull/Continue."""
+        installed = backend.is_installed(tag)
+        shortfall = None if installed else backend.check_ram_for_model(tag)
+        if shortfall is None:
+            self.ram_warning_label.setVisible(False)
+            self.ram_warning_label.setText("")
+            return
+        required_gb, available_gb = shortfall
+        self.ram_warning_label.setText(
+            f"\u26a0 \u201c{tag}\u201d recommends about {required_gb:.0f} GB of RAM, "
+            f"but this device has only {available_gb:.1f} GB. It may run very "
+            "slowly, swap heavily, or fail to load."
         )
-        if self._models_panel_open:
-            self._refresh_model_rows()
+        self.ram_warning_label.setVisible(True)
+
+    def _update_continue_btn(self) -> None:
+        tag = self.selected_model_tag
+        if not tag:
+            self.continue_btn.setText("Select a model")
+            self.continue_btn.setEnabled(False)
+            return
+        if not self._connected:
+            self.continue_btn.setText("Waiting for Ollama\u2026")
+            self.continue_btn.setEnabled(False)
+            return
+        if tag in self.pull_workers:
+            self.continue_btn.setEnabled(False)
+            self.continue_btn.setText(f"Downloading {tag}\u2026")
+            return
+        self.continue_btn.setEnabled(True)
+        if backend.is_installed(tag):
+            self.continue_btn.setText(f"Continue with {tag}  \u2192")
+        else:
+            self.continue_btn.setText(f"Download {tag} to continue  \u2192")
+
+    def _on_continue_clicked(self) -> None:
+        tag = self.selected_model_tag
+        if not tag or not self._connected:
+            return
+
+        if not backend.is_installed(tag):
+            # Hard gate: never let the user reach Benchmark/Dashboard with
+            # a model that isn't actually pulled onto this device. Instead
+            # of proceeding, kick off the pull here (after the RAM check)
+            # and auto-continue once it finishes successfully.
+            if not self._confirm_ram_ok(tag):
+                return
+            self._auto_continue_tag = tag
+            self._start_pull(tag)
+            return
+
+        app_state.set_selected_model(tag)
+        self.model_chosen.emit(tag)
+
+    def _confirm_ram_ok(self, model_tag: str) -> bool:
+        """Show a blocking error dialog (and let the user back out) if
+        this device's RAM looks too small for ``model_tag``. Returns True
+        to proceed anyway, False to cancel. A model already installed
+        skips the check entirely -- if it runs today, it'll keep running."""
+        shortfall = backend.check_ram_for_model(model_tag)
+        if shortfall is None:
+            return True
+        required_gb, available_gb = shortfall
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Insufficient RAM for this model")
+        box.setText(f"\u201c{model_tag}\u201d likely will not run well on this device.")
+        box.setInformativeText(
+            f"This model recommends at least {required_gb:.0f} GB of RAM, "
+            f"but this device has about {available_gb:.1f} GB available.\n\n"
+            "Downloading and running it anyway may cause Ollama to run very "
+            "slowly, swap heavily, or fail to load the model entirely.\n\n"
+            "Continue anyway?"
+        )
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        choice = box.exec()
+        return choice == QMessageBox.StandardButton.Yes
+
+
+    # ---------------- model list ----------------
 
     def _refresh_model_rows(self) -> None:
         installed = backend.installed_model_tags()
         for tag, row in self.model_rows.items():
             row.set_installed(tag in installed or tag.split(":")[0] in installed)
-        self._refresh_device_label()
+        if self.selected_model_tag:
+            self._update_ram_warning(self.selected_model_tag)
+        self._update_continue_btn()
 
-    def _refresh_device_label(self) -> None:
-        installed = sorted(backend.installed_model_tags())
-        if not installed:
-            self.device_label.setText("No models installed on this device yet.")
+
+    def _load_cloud_models(self) -> None:
+        """Pull in any "other model" tags previously saved to Supabase
+        (from this device or another one) and add a row for each that isn't
+        already part of the built-in catalog, so they show up on every
+        launch instead of only for the session that added them."""
+        if not supabase_sync.is_configured():
             return
-        self.device_label.setText(f"On this device ({len(installed)}): " + ", ".join(installed))
+        for entry in supabase_sync.fetch_custom_models():
+            tag = (entry.get("model_tag") or "").strip()
+            if not tag or tag in self.model_rows:
+                continue
+            label = entry.get("label") or tag
+            row = ModelRow(tag, label)
+            row.pull_requested.connect(self._start_pull)
+            row.stop_requested.connect(self._stop_pull)
+            row.selected.connect(self._select_model)
+            self.model_rows[tag] = row
+            self.rows_lay.addWidget(row)
+            row.set_installed(backend.is_installed(tag))
 
     def _pull_custom_model(self) -> None:
         tag = self.custom_model_input.text().strip()
         if not tag:
             return
-        if tag not in self.model_rows:
+        is_new = tag not in self.model_rows
+        if is_new:
             row = ModelRow(tag, tag)
             row.pull_requested.connect(self._start_pull)
+            row.stop_requested.connect(self._stop_pull)
+            row.selected.connect(self._select_model)
             self.model_rows[tag] = row
-            self.rows_lay.insertWidget(self.rows_lay.count() - 1, row)
+            self.rows_lay.addWidget(row)
             row.set_installed(backend.is_installed(tag))
         self.custom_model_input.clear()
+        # Remember it in Supabase right away (not gated on the pull actually
+        # succeeding) so it reappears in "Add other models" on next launch
+        # even if this pull is retried later.
+        if is_new:
+            supabase_sync.save_custom_model(tag)
+        self._select_model(tag)
         self._start_pull(tag)
 
     def _start_pull(self, model_tag: str) -> None:
@@ -405,6 +502,8 @@ class StartupScreen(QWidget):
             return
         row = self.model_rows.get(model_tag)
         if row is None:
+            return
+        if not backend.is_installed(model_tag) and not self._confirm_ram_ok(model_tag):
             return
         row.set_pulling(True)
 
@@ -414,14 +513,43 @@ class StartupScreen(QWidget):
         self.pull_workers[model_tag] = worker
         worker.start()
 
+    def _stop_pull(self, model_tag: str) -> None:
+        worker = self.pull_workers.get(model_tag)
+        if worker is None:
+            return
+        row = self.model_rows.get(model_tag)
+        if row is not None:
+            row.stop_btn.setEnabled(False)
+            row.progress_label.setVisible(True)
+            row.progress_label.setText("Stopping\u2026")
+        worker.cancel()
+        if self._auto_continue_tag == model_tag:
+            self._auto_continue_tag = None
+
     def _pull_finished(self, model_tag: str, ok: bool, msg: str) -> None:
         row = self.model_rows.get(model_tag)
         self.pull_workers.pop(model_tag, None)
+        cancelled = msg == "Cancelled"
         if row is not None:
             row.set_pulling(False)
             if not ok and msg:
                 row.progress_label.setVisible(True)
-                row.progress_label.setText(f"Failed: {msg}")
+                row.progress_label.setText("Stopped" if cancelled else f"Couldn't finish: {msg}")
         self._refresh_model_rows()
-        if ok and self._connected:
-            self._show_model_picker()
+
+        if self._auto_continue_tag == model_tag:
+            self._auto_continue_tag = None
+            if ok and backend.is_installed(model_tag):
+                app_state.set_selected_model(model_tag)
+                self.model_chosen.emit(model_tag)
+            elif not cancelled:
+                QMessageBox.critical(
+                    self,
+                    "Download didn't finish",
+                    (
+                        f"\u201c{model_tag}\u201d didn't finish downloading"
+                        + (f" ({msg})." if msg else ".")
+                        + "\n\nIt needs to be on this device before you can benchmark or "
+                        "view results for it - give it another try when you're ready."
+                    ),
+                )

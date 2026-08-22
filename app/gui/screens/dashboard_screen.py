@@ -1,902 +1,764 @@
+"""Dashboard screen - PRISM's main analytical surface.
+
+This is prompt-reliability's dashboard (KPI cards, filter bar, four bar
+charts, and a sortable detail table) rewired onto the merged app's own
+data layer (``app.services.backend`` / the local SQLite run index +
+bundled seed results) instead of prism_app's ``appdata``/``resources``
+modules, plus an added **comparison-model** selector so two models can be
+viewed side by side without leaving the screen.
+"""
 from __future__ import annotations
 
+import sqlite3
+from typing import Any, Optional
+
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QPushButton,
-    QComboBox, QTableWidget, QTableWidgetItem, QTabWidget, QScrollArea,
-    QHeaderView, QStackedWidget, QFileDialog, QMessageBox,
+    QAbstractItemView,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLayout,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCharts import (
-    QChart, QChartView, QBarSeries, QBarSet, QBarCategoryAxis, QValueAxis,
-    QLineSeries, QPieSeries, QScatterSeries,
-)
 
-from app.gui.widgets import (
-    card, h1, h2, body, faint, divider, SectionHeader, MetricTile, kicker,
-    EmptyStateCTA,
-)
-from app.services import backend, app_state
-from app.services import pdf_report
+from prism_core import config
+from app.gui.theme import DUSK, PAPER
+from app.services import backend, pdf_report, app_state
 
-PRIMARY_COLOR = QColor("#8f7cf2")
-COMPARE_COLOR = QColor("#5fd18e")
-
-# Chart text (titles/legends/axis labels) must contrast against whichever
-# palette is active — the dashboard used to hardcode light-on-dark colors,
-# which read as nearly invisible on the paper (light) theme. These pick the
-# right pair at draw time instead.
-_DARK_THEME_TEXT = {"title": QColor("#eceaf5"), "axis": QColor("#a6a4b8")}
-_LIGHT_THEME_TEXT = {"title": QColor("#2a2733"), "axis": QColor("#6b6879")}
+try:
+    from PySide6.QtCharts import (
+        QBarCategoryAxis,
+        QBarSeries,
+        QBarSet,
+        QChart,
+        QChartView,
+        QLineSeries,
+        QValueAxis,
+    )
+    HAS_CHARTS = True
+except Exception:
+    HAS_CHARTS = False
 
 
-def _chart_text_colors() -> dict:
-    return _DARK_THEME_TEXT if app_state.get_theme() == "dusk" else _LIGHT_THEME_TEXT
+def _f(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
-AXIS_LABEL_COLOR = QColor("#a6a4b8")  # kept as fallback default; call sites use _chart_text_colors()
-
-# Distinct palette used when plotting *all* locally-benchmarked models at
-# once (comparison tab / scatter / radar) — cycles if there are more models
-# than colors.
-MULTI_COLORS = [
-    QColor("#8f7cf2"), QColor("#5fd18e"), QColor("#e8b45c"),
-    QColor("#ea6b6b"), QColor("#5cc7e8"), QColor("#f28fd0"),
-    QColor("#c9d15f"), QColor("#9d7cf2"),
-]
+def _pct(value: Any) -> str:
+    return f"{_f(value) * 100.0:.1f}%"
 
 
-def _color_for(index: int) -> QColor:
-    return MULTI_COLORS[index % len(MULTI_COLORS)]
-
-PCT_FIELDS = {
-    "prompt_response_accuracy", "conditional_accuracy", "answer_recovery_rate",
-    "instruction_compliance_rate", "question_majority_accuracy", "mean_agreement",
-    "mean_prompt_sensitivity", "answer_unanimous_rate",
-    "prompt_invariant_incorrect_rate", "accuracy", "instruction_compliant_rate",
-}
-
-PRETTY = {
-    "dataset": "Dataset", "n_questions": "Questions",
-    "prompt_response_accuracy": "Accuracy", "conditional_accuracy": "Cond. accuracy",
-    "answer_recovery_rate": "Recovery rate", "instruction_compliance_rate": "Instr. compliance",
-    "question_majority_accuracy": "Majority accuracy", "mean_agreement": "Agreement",
-    "mean_prompt_sensitivity": "Prompt sensitivity", "answer_unanimous_rate": "Unanimous rate",
-    "prompt_invariant_incorrect_rate": "Invariant-incorrect",
-}
-TABLE_COLUMNS = [
-    "dataset", "n_questions", "prompt_response_accuracy", "conditional_accuracy",
-    "mean_agreement", "mean_prompt_sensitivity", "instruction_compliance_rate",
-    "answer_recovery_rate", "answer_unanimous_rate", "prompt_invariant_incorrect_rate",
-]
+def _clear_layout(layout: QLayout) -> None:
+    while layout.count():
+        item = layout.takeAt(0)
+        widget = item.widget()
+        if widget is not None:
+            widget.deleteLater()
+        elif item.layout() is not None:
+            _clear_layout(item.layout())
 
 
-def _fmt(key: str, value) -> str:
-    if key in PCT_FIELDS:
-        try:
-            return f"{float(value) * 100:.1f}%"
-        except (TypeError, ValueError):
-            return str(value)
-    return str(value)
+class KPICard(QFrame):
+    """Compact summary metric card."""
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("KpiCard")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(4)
+
+        self._title_lbl = QLabel(title)
+        self._title_lbl.setObjectName("KpiTitle")
+        layout.addWidget(self._title_lbl)
+
+        self._value_lbl = QLabel("-")
+        self._value_lbl.setObjectName("KpiValue")
+        layout.addWidget(self._value_lbl)
+
+        self._sub_lbl = QLabel("")
+        self._sub_lbl.setObjectName("Faint")
+        layout.addWidget(self._sub_lbl)
+
+    def set_data(self, value: str, subtext: str = "") -> None:
+        self._value_lbl.setText(value)
+        self._sub_lbl.setText(subtext)
 
 
-def _avg(rows: list[dict], key: str) -> float:
-    vals = [float(r.get(key, 0) or 0) for r in rows]
-    return sum(vals) / len(vals) if vals else 0.0
+def _active_palette():
+    """Resolve the palette (paper/dusk) currently selected in Settings, so
+    charts are drawn to match - instead of always rendering in "paper"
+    colors even when the rest of the app is in dark ("dusk") mode."""
+    return DUSK if app_state.get_theme() == "dusk" else PAPER
+
+
+def _chart_series(p) -> list[str]:
+    return [p.accent, p.good, p.warn, p.bad, p.text_dim]
 
 
 class DashboardScreen(QWidget):
-    benchmark_requested = Signal(str)   # model_tag the user wants to download+run to compare
+    """Comprehensive analytical dashboard for research and user benchmark results."""
 
-    def __init__(self, parent=None):
+    benchmark_requested = Signal(str)  # model_tag the user wants to download+run to compare
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.conn = backend.get_conn()
-        self.model_tag: str | None = None
-        self.compare_tag: str | None = None
-        # when a comparison model is chosen, this can be flipped off to
-        # temporarily show only the primary model again without losing the
-        # chosen comparison (compare_tag stays set the whole time)
-        self.show_compare = True
+        self._ds_rows: list[dict[str, Any]] = []
+        self._pr_rows: list[dict[str, Any]] = []
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        self._build_ui()
+        self.reload_data()
+
+    # ------------------------------------------------------------------- UI
+    def _build_ui(self) -> None:
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        outer.addWidget(scroll)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
 
-        content = QWidget()
-        scroll.setWidget(content)
-        root = QVBoxLayout(content)
-        root.setContentsMargins(28, 24, 28, 28)
-        root.setSpacing(18)
+        # Outer widget fills the scroll area and centers a max-width
+        # content column, so the dashboard reads as a centered page with
+        # generous breathing room instead of stretching edge-to-edge on
+        # wide windows.
+        outer_container = QWidget()
+        outer_container.setObjectName("DashboardContainer")
+        outer_row = QHBoxLayout(outer_container)
+        outer_row.setContentsMargins(0, 0, 0, 0)
+        outer_row.setSpacing(0)
+        outer_row.addStretch(1)
 
-        # ---------------- header ----------------
-        header_row = QHBoxLayout()
-        header_col = QVBoxLayout()
-        header_col.setSpacing(2)
-        header_col.addWidget(kicker("Dashboard"))
-        self.model_title = h1("No model selected")
-        header_col.addWidget(self.model_title)
-        self.model_sub = body("Pick a model on the startup screen, then run a benchmark.")
-        header_col.addWidget(self.model_sub)
-        header_row.addLayout(header_col)
-        header_row.addStretch(1)
+        container = QWidget()
+        container.setObjectName("DashboardContent")
+        container.setMaximumWidth(1180)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(40, 36, 40, 44)
+        layout.setSpacing(28)
 
-        self.rerun_btn = QPushButton("Re-run benchmark")
-        self.rerun_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.rerun_btn.clicked.connect(lambda: self.benchmark_requested.emit(self.model_tag or ""))
-        header_row.addWidget(self.rerun_btn, 0, Qt.AlignmentFlag.AlignTop)
+        outer_row.addWidget(container, 10)
+        outer_row.addStretch(1)
 
-        self.compare_toggle = QPushButton("+ Compare with another model")
-        self.compare_toggle.setObjectName("CompareBtn")
-        self.compare_toggle.setCheckable(True)
-        self.compare_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.compare_toggle.clicked.connect(self._toggle_compare_drawer)
-        header_row.addWidget(self.compare_toggle, 0, Qt.AlignmentFlag.AlignTop)
-
-        self.export_btn = QPushButton("Download PDF summary")
-        self.export_btn.setObjectName("Primary")
-        self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.export_btn.clicked.connect(self._export_pdf)
-        header_row.addWidget(self.export_btn, 0, Qt.AlignmentFlag.AlignTop)
-        root.addLayout(header_row)
-
-        # ---------------- compare drawer ----------------
-        self.compare_drawer = QFrame()
-        self.compare_drawer.setObjectName("CompareDrawer")
-        self.compare_drawer.setVisible(False)
-        drawer_lay = QVBoxLayout(self.compare_drawer)
-        drawer_lay.setContentsMargins(20, 16, 20, 16)
-        drawer_lay.setSpacing(10)
-
-        drawer_top = QHBoxLayout()
-        drawer_top.addWidget(h2("Compare against"))
-        drawer_top.addStretch(1)
-        self.compare_combo = QComboBox()
-        self.compare_combo.setMinimumWidth(240)
-        drawer_top.addWidget(self.compare_combo)
-        self.compare_go_btn = QPushButton("Compare")
-        self.compare_go_btn.setObjectName("Primary")
-        self.compare_go_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.compare_go_btn.clicked.connect(self._on_compare_selected)
-        drawer_top.addWidget(self.compare_go_btn)
-        self.compare_clear_btn = QPushButton("Clear")
-        self.compare_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.compare_clear_btn.setVisible(False)
-        self.compare_clear_btn.clicked.connect(self._clear_compare)
-        drawer_top.addWidget(self.compare_clear_btn)
-        # lets the user flip back to a single-model view without losing the
-        # chosen comparison model \u2014 re-checking it brings the overlay right back
-        self.compare_show_toggle = QPushButton("Show only this model")
-        self.compare_show_toggle.setObjectName("CompareBtn")
-        self.compare_show_toggle.setCheckable(True)
-        self.compare_show_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.compare_show_toggle.setVisible(False)
-        self.compare_show_toggle.toggled.connect(self._on_show_compare_toggled)
-        drawer_top.addWidget(self.compare_show_toggle)
-        drawer_lay.addLayout(drawer_top)
-
-        self.compare_stack = QStackedWidget()
-        self._compare_info = body(
-            "Choose a model above. If it already has local benchmark data, its "
-            "results are overlaid on every chart below. Otherwise you'll be asked "
-            "to download the model and run inference first."
+        # 1. Header -----------------------------------------------------
+        header_box = QVBoxLayout()
+        header_box.setSpacing(2)
+        title = QLabel("Dashboard")
+        title.setObjectName("H1")
+        header_box.addWidget(title)
+        subtitle = QLabel(
+            "Explore PRISM benchmark results across models, datasets, and prompting conditions."
         )
-        self._compare_empty = EmptyStateCTA(
-            "No local data for this model",
-            "PRISM hasn't benchmarked this model on this device yet.",
-            "Download & run benchmark",
-        )
-        self._compare_empty.button.clicked.connect(
-            lambda: self.benchmark_requested.emit(self.compare_combo.currentData() or "")
-        )
-        self.compare_stack.addWidget(self._compare_info)
-        self.compare_stack.addWidget(self._compare_empty)
-        drawer_lay.addWidget(self.compare_stack)
+        subtitle.setObjectName("Body")
+        header_box.addWidget(subtitle)
+        layout.addLayout(header_box)
 
-        root.addWidget(self.compare_drawer)
+        # 2. Filter bar (model, comparison model, dataset, source) ------
+        # Two rows instead of one long strip: filters on top, actions
+        # below - so the action buttons never get squeezed/clipped when
+        # the window is narrower than all four combos + both buttons.
+        filter_frame = QFrame()
+        filter_frame.setObjectName("FilterBar")
+        filter_outer = QVBoxLayout(filter_frame)
+        filter_outer.setContentsMargins(20, 16, 20, 16)
+        filter_outer.setSpacing(14)
 
-        # ---------------- metric tiles ----------------
-        self.tiles_row = QHBoxLayout()
-        self.tile_questions = MetricTile("Questions run", "—")
-        self.tile_accuracy = MetricTile("Accuracy", "—")
-        self.tile_agreement = MetricTile("Agreement", "—")
-        self.tile_compliance = MetricTile("Instr. compliance", "—")
-        self.tile_invariant = MetricTile("Invariant-incorrect", "—")
-        for t in (self.tile_questions, self.tile_accuracy, self.tile_agreement,
-                  self.tile_compliance, self.tile_invariant):
-            self.tiles_row.addWidget(t)
-        root.addLayout(self.tiles_row)
+        filter_layout = QHBoxLayout()
+        filter_layout.setSpacing(18)
 
-        note = QFrame()
-        note.setObjectName("CardFlat")
-        note_lay = QHBoxLayout(note)
-        note_lay.setContentsMargins(16, 10, 16, 10)
-        note_lay.addWidget(body(
-            "PRISM measures answer stability across five equivalent prompts as well "
-            "as accuracy — a model can be highly consistent yet consistently wrong."
-        ))
-        root.addWidget(note)
+        filter_layout.addWidget(QLabel("Model:"))
+        self._model_combo = QComboBox()
+        self._model_combo.setMinimumWidth(160)
+        self._model_combo.currentIndexChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._model_combo)
 
-        # ---------------- charts + table ----------------
-        tabs_card = card("Card")
-        tl = QVBoxLayout(tabs_card)
-        tl.setContentsMargins(16, 14, 16, 16)
-        self.tabs = QTabWidget()
-        tl.addWidget(self.tabs)
+        # --- Comparison model selector -----------------------------------
+        compare_lbl = QLabel("Compare with:")
+        filter_layout.addWidget(compare_lbl)
+        self._compare_combo = QComboBox()
+        self._compare_combo.setMinimumWidth(160)
+        self._compare_combo.currentIndexChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._compare_combo)
 
-        self.bar_chart_view = self._new_chart_view()
-        self.line_chart_view = self._new_chart_view()
-        self.pie_chart_view = self._new_chart_view()
-        self.scatter_chart_view = self._new_chart_view()
-        self.allmodel_bar_view = self._new_chart_view()
-        self.detail_chart_view = self._new_chart_view(height=280)
-        self.leaderboard_chart_view = self._new_chart_view(height=280)
-        self.detailed_table = QTableWidget()
-        self.leaderboard_table = QTableWidget()
+        filter_layout.addWidget(QLabel("Dataset:"))
+        self._dataset_combo = QComboBox()
+        self._dataset_combo.setMinimumWidth(150)
+        self._dataset_combo.currentIndexChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._dataset_combo)
 
-        self._wrap_chart_tab("Metrics by dataset", self.bar_chart_view)
-        self._wrap_chart_tab("Accuracy by prompt condition", self.line_chart_view)
-        self._wrap_chart_tab("Answer consistency", self.pie_chart_view)
-        self._wrap_chart_tab("Accuracy vs. agreement", self.scatter_chart_view)
-        self._wrap_chart_tab("All models \u2014 accuracy", self.allmodel_bar_view)
-        self._wrap_chart_and_table_tab("Detailed table", self.detail_chart_view, self.detailed_table)
-        self._wrap_chart_and_table_tab("Leaderboard (all models)", self.leaderboard_chart_view, self.leaderboard_table)
+        filter_layout.addWidget(QLabel("Source:"))
+        self._source_combo = QComboBox()
+        self._source_combo.setMinimumWidth(150)
+        self._source_combo.addItems(["All Sources", "Research Results", "User Runs"])
+        self._source_combo.currentIndexChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._source_combo)
 
-        root.addWidget(tabs_card)
-        root.addStretch(1)
+        filter_layout.addStretch(1)
+        filter_outer.addLayout(filter_layout)
 
-    # ---------------- construction helpers ----------------
+        actions_layout = QHBoxLayout()
+        actions_layout.setSpacing(10)
+        actions_layout.addStretch(1)
 
-    def _new_chart_view(self, height: int = 360) -> QChartView:
-        v = QChartView()
-        v.setMinimumHeight(height)
-        v.setRenderHint(QPainter.RenderHint.Antialiasing)
-        return v
+        refresh_btn = QPushButton("Refresh Data")
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh_btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        refresh_btn.clicked.connect(self.reload_data)
+        actions_layout.addWidget(refresh_btn)
 
-    def _wrap_chart_tab(self, title: str, chart_view: QChartView) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(4, 8, 4, 4)
-        lay.addWidget(chart_view)
-        self.tabs.addTab(w, title)
+        download_pdf_btn = QPushButton("Download PDF")
+        download_pdf_btn.setObjectName("Primary")
+        download_pdf_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        download_pdf_btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        download_pdf_btn.clicked.connect(self._on_download_pdf)
+        actions_layout.addWidget(download_pdf_btn)
 
-    def _wrap_tab(self, title: str, table: QTableWidget) -> None:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(4, 8, 4, 4)
-        lay.addWidget(table)
-        self.tabs.addTab(w, title)
+        filter_outer.addLayout(actions_layout)
 
-    def _wrap_chart_and_table_tab(self, title: str, chart_view: QChartView, table: QTableWidget) -> None:
-        """A chart on top, its backing table below it — used for the two
-        table-only tabs so every tab on the dashboard shows a graph, not
-        just numbers."""
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(4, 8, 4, 4)
-        lay.setSpacing(10)
-        lay.addWidget(chart_view)
-        lay.addWidget(table)
-        self.tabs.addTab(w, title)
+        layout.addWidget(filter_frame)
 
-    # ---------------- public API ----------------
+        # 3. KPI cards ----------------------------------------------------
+        kpi_grid = QGridLayout()
+        kpi_grid.setHorizontalSpacing(18)
+        kpi_grid.setVerticalSpacing(18)
 
-    def set_model(self, model_tag: str | None) -> None:
-        self.model_tag = model_tag
-        self.compare_tag = None
-        self.show_compare = True
-        self.compare_clear_btn.setVisible(False)
-        self.compare_show_toggle.setVisible(False)
-        self.compare_show_toggle.setChecked(False)
-        self.refresh()
+        self._kpi_acc = KPICard("Accuracy", self)
+        self._kpi_agree = KPICard("Mean Agreement", self)
+        self._kpi_sens = KPICard("Prompt Sensitivity", self)
+        self._kpi_comp = KPICard("Instruction Compliance", self)
+        self._kpi_rec = KPICard("Answer Recovery", self)
+        self._kpi_unk = KPICard("Unknown Rate", self)
 
-    def refresh(self) -> None:
-        if not self.model_tag:
-            self.model_title.setText("No model selected")
-            self.model_sub.setText("Pick a model on the startup screen, then run a benchmark.")
-            self.rerun_btn.setEnabled(False)
-            self.compare_toggle.setEnabled(False)
-            return
+        kpi_grid.addWidget(self._kpi_acc, 0, 0)
+        kpi_grid.addWidget(self._kpi_agree, 0, 1)
+        kpi_grid.addWidget(self._kpi_sens, 0, 2)
+        kpi_grid.addWidget(self._kpi_comp, 1, 0)
+        kpi_grid.addWidget(self._kpi_rec, 1, 1)
+        kpi_grid.addWidget(self._kpi_unk, 1, 2)
 
-        self.rerun_btn.setEnabled(True)
-        self.compare_toggle.setEnabled(True)
-        label = backend.model_label(self.model_tag)
-        self.model_title.setText(label)
+        layout.addLayout(kpi_grid)
 
-        rows = backend.model_dataset_rows(self.conn, self.model_tag)
-        info = backend.run_info(self.conn, self.model_tag)
-        if not rows:
-            self.model_sub.setText(f"\u201c{self.model_tag}\u201d \u2014 no local benchmark yet.")
+        # 4. Charts ---------------------------------------------------------
+        if HAS_CHARTS:
+            self._charts_grid = QGridLayout()
+            self._charts_grid.setHorizontalSpacing(22)
+            self._charts_grid.setVerticalSpacing(22)
+            self._charts_grid.setColumnStretch(0, 1)
+            self._charts_grid.setColumnStretch(1, 1)
+            layout.addLayout(self._charts_grid)
         else:
-            when = (info or {}).get("finished_utc") or (info or {}).get("created_utc") or ""
-            self.model_sub.setText(f"\u201c{self.model_tag}\u201d \u00b7 last run {when[:19].replace('T', ' ')} UTC")
-
-        # the toggle lets the user park the comparison without losing it \u2014
-        # when it's off, every chart/table below just gets an empty
-        # compare_rows and renders exactly like single-model mode
-        compare_rows = (
-            backend.model_dataset_rows(self.conn, self.compare_tag)
-            if (self.compare_tag and self.show_compare) else []
-        )
-
-        self._populate_compare_combo()
-        self._update_tiles(rows, compare_rows)
-        self._update_bar_chart(rows, compare_rows)
-        self._update_line_chart(
-            backend.model_prompt_rows(self.conn, self.model_tag) if rows else [],
-            backend.model_prompt_rows(self.conn, self.compare_tag) if compare_rows else [],
-        )
-        self._update_pie_chart(rows, compare_rows)
-        self._update_table(rows, compare_rows)
-        self._update_scatter_chart()
-        self._update_allmodel_bar_chart()
-        self._update_leaderboard_table()
-        self._update_detail_chart(rows, compare_rows)
-        self._update_leaderboard_chart()
-
-    # ---------------- compare drawer ----------------
-
-    def _toggle_compare_drawer(self) -> None:
-        self.compare_drawer.setVisible(self.compare_toggle.isChecked())
-        if self.compare_toggle.isChecked():
-            self._populate_compare_combo()
-
-    def _populate_compare_combo(self) -> None:
-        self.compare_combo.blockSignals(True)
-        self.compare_combo.clear()
-        have_data = backend.models_with_data(self.conn)
-        for tag, meta in backend.models_catalog().items():
-            if tag == self.model_tag:
-                continue
-            suffix = " \u00b7 data available" if tag in have_data else " \u00b7 not benchmarked yet"
-            self.compare_combo.addItem(f"{meta['label']}{suffix}", userData=tag)
-        self.compare_combo.blockSignals(False)
-
-    def _on_compare_selected(self) -> None:
-        tag = self.compare_combo.currentData()
-        if not tag:
-            return
-        if backend.has_data(self.conn, tag):
-            self.compare_tag = tag
-            self.show_compare = True
-            self.compare_clear_btn.setVisible(True)
-            self.compare_show_toggle.setVisible(True)
-            self.compare_show_toggle.blockSignals(True)
-            self.compare_show_toggle.setChecked(False)
-            self.compare_show_toggle.blockSignals(False)
-            self.compare_show_toggle.setText("Show only this model")
-            self.compare_stack.setCurrentWidget(self._compare_info)
-            self.refresh()
-        else:
-            self.compare_tag = None
-            self.compare_clear_btn.setVisible(False)
-            self.compare_show_toggle.setVisible(False)
-            self._compare_empty.button.setText(
-                f"Download & run benchmark for {backend.model_label(tag)}"
+            no_charts = QLabel(
+                "Note: PySide6.QtCharts is not available in the current environment. "
+                "All analytical data is displayed in the table below."
             )
-            self.compare_stack.setCurrentWidget(self._compare_empty)
-            self.refresh()
+            no_charts.setObjectName("Faint")
+            layout.addWidget(no_charts)
 
-    def _on_show_compare_toggled(self, checked: bool) -> None:
-        # checked == "show only the primary model" (comparison hidden)
-        self.show_compare = not checked
-        self.compare_show_toggle.setText(
-            "Show comparison again" if checked else "Show only this model"
-        )
-        self.refresh()
+        # 5. Detail table -----------------------------------------------
+        table_box = QVBoxLayout()
+        table_box.setSpacing(12)
+        table_header_row = QHBoxLayout()
+        table_title = QLabel("Detailed Results")
+        table_title.setObjectName("H2")
+        table_header_row.addWidget(table_title)
+        table_header_row.addStretch(1)
+        table_box.addLayout(table_header_row)
 
-    def _clear_compare(self) -> None:
-        self.compare_tag = None
-        self.show_compare = True
-        self.compare_clear_btn.setVisible(False)
-        self.compare_show_toggle.setVisible(False)
-        self.compare_show_toggle.blockSignals(True)
-        self.compare_show_toggle.setChecked(False)
-        self.compare_show_toggle.blockSignals(False)
-        self.refresh()
+        self._table = QTableWidget()
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setSortingEnabled(True)
+        self._table.setMinimumHeight(320)
+        table_box.addWidget(self._table)
 
-    # ---------------- data -> widgets ----------------
+        layout.addLayout(table_box)
 
-    def _update_tiles(self, rows: list[dict], compare_rows: list[dict] | None = None) -> None:
-        tiles = (self.tile_questions, self.tile_accuracy, self.tile_agreement,
-                 self.tile_compliance, self.tile_invariant)
-        if not rows:
-            for t in tiles:
-                t.set_value("—")
-                t.set_compare(None)
-            return
+        scroll.setWidget(outer_container)
+        main_layout.addWidget(scroll)
 
-        total_q = sum(int(float(r.get("n_questions", 0) or 0)) for r in rows)
-        self.tile_questions.set_value(str(total_q))
-        self.tile_accuracy.set_value(f"{_avg(rows, 'prompt_response_accuracy') * 100:.1f}%")
-        self.tile_agreement.set_value(f"{_avg(rows, 'mean_agreement') * 100:.1f}%")
-        self.tile_compliance.set_value(f"{_avg(rows, 'instruction_compliance_rate') * 100:.1f}%")
-        self.tile_invariant.set_value(f"{_avg(rows, 'prompt_invariant_incorrect_rate') * 100:.1f}%")
+    # --------------------------------------------------------- Data loading
+    def reload_data(self) -> None:
+        """Load bundled research data + any local user runs from the merged
+        app's own SQLite run index (app.services.backend), instead of
+        prism_app's file-based appdata/resources lookup."""
+        self._ds_rows = []
+        self._pr_rows = []
 
-        # Show the comparison model's numbers as a second line on each tile,
-        # so "Compare" visibly changes the dashboard even before you look at
-        # the charts/table below.
-        if self.compare_tag and compare_rows:
-            cmp_label = backend.model_label(self.compare_tag)
-            cmp_total_q = sum(int(float(r.get("n_questions", 0) or 0)) for r in compare_rows)
-            self.tile_questions.set_compare(f"vs {cmp_label}: {cmp_total_q}")
-            self.tile_accuracy.set_compare(
-                f"vs {cmp_label}: {_avg(compare_rows, 'prompt_response_accuracy') * 100:.1f}%")
-            self.tile_agreement.set_compare(
-                f"vs {cmp_label}: {_avg(compare_rows, 'mean_agreement') * 100:.1f}%")
-            self.tile_compliance.set_compare(
-                f"vs {cmp_label}: {_avg(compare_rows, 'instruction_compliance_rate') * 100:.1f}%")
-            self.tile_invariant.set_compare(
-                f"vs {cmp_label}: {_avg(compare_rows, 'prompt_invariant_incorrect_rate') * 100:.1f}%")
-        else:
-            for t in tiles:
-                t.set_compare(None)
+        conn: sqlite3.Connection = backend.get_conn()
+        try:
+            for tag, run in backend.models_with_data(conn).items():
+                is_seed = str(run["app_version"] or "").startswith("bundled-seed")
+                source = "Research" if is_seed else "User Run"
 
-    def _update_bar_chart(self, rows: list[dict], compare_rows: list[dict]) -> None:
-        chart = QChart()
-        chart.setBackgroundVisible(False)
-        tc = _chart_text_colors()
-        chart.legend().setLabelColor(tc["axis"])
-        chart.setTitleBrush(tc["title"])
-        chart.setTitle("Accuracy & agreement by dataset")
+                for row in backend.model_dataset_rows(conn, tag):
+                    row = dict(row)
+                    row["source"] = source
+                    row["run_id"] = run["benchmark_run_id"]
+                    self._ds_rows.append(row)
 
-        if not rows:
-            self.bar_chart_view.setChart(chart)
-            return
+                for row in backend.model_prompt_rows(conn, tag):
+                    row = dict(row)
+                    row["model"] = tag
+                    row["source"] = source
+                    row["run_id"] = run["benchmark_run_id"]
+                    self._pr_rows.append(row)
+        finally:
+            conn.close()
 
-        datasets = sorted({r["dataset"] for r in rows} | {r["dataset"] for r in compare_rows})
-        by_ds = {r["dataset"]: r for r in rows}
-        cmp_by_ds = {r["dataset"]: r for r in compare_rows}
+        self._populate_filter_options()
+        self._update_views()
 
-        series = QBarSeries()
-        acc_set = QBarSet(f"{backend.model_label(self.model_tag)} \u00b7 accuracy")
-        acc_set.setColor(PRIMARY_COLOR)
-        agree_set = QBarSet(f"{backend.model_label(self.model_tag)} \u00b7 agreement")
-        agree_set.setColor(PRIMARY_COLOR.lighter(140))
+    def _populate_filter_options(self) -> None:
+        cur_model = self._model_combo.currentText()
+        cur_compare = self._compare_combo.currentText()
+        cur_ds = self._dataset_combo.currentText()
+
+        models = sorted({r.get("model", "") for r in self._ds_rows if r.get("model")})
+        datasets = sorted({r.get("dataset", "") for r in self._ds_rows if r.get("dataset")})
+
+        for combo in (self._model_combo, self._compare_combo, self._dataset_combo):
+            combo.blockSignals(True)
+
+        self._model_combo.clear()
+        self._model_combo.addItem("All Models")
+        for m in models:
+            self._model_combo.addItem(m)
+
+        self._compare_combo.clear()
+        self._compare_combo.addItem("None")
+        for m in models:
+            self._compare_combo.addItem(m)
+
+        self._dataset_combo.clear()
+        self._dataset_combo.addItem("All Datasets")
         for d in datasets:
-            r = by_ds.get(d, {})
-            acc_set.append(float(r.get("prompt_response_accuracy", 0) or 0) * 100)
-            agree_set.append(float(r.get("mean_agreement", 0) or 0) * 100)
-        series.append(acc_set)
-        series.append(agree_set)
+            self._dataset_combo.addItem(d)
 
-        if self.compare_tag and compare_rows:
-            cmp_acc = QBarSet(f"{backend.model_label(self.compare_tag)} \u00b7 accuracy")
-            cmp_acc.setColor(COMPARE_COLOR)
-            cmp_agree = QBarSet(f"{backend.model_label(self.compare_tag)} \u00b7 agreement")
-            cmp_agree.setColor(COMPARE_COLOR.lighter(140))
-            for d in datasets:
-                r = cmp_by_ds.get(d, {})
-                cmp_acc.append(float(r.get("prompt_response_accuracy", 0) or 0) * 100)
-                cmp_agree.append(float(r.get("mean_agreement", 0) or 0) * 100)
-            series.append(cmp_acc)
-            series.append(cmp_agree)
+        idx = self._model_combo.findText(cur_model)
+        if idx >= 0:
+            self._model_combo.setCurrentIndex(idx)
+        idx = self._compare_combo.findText(cur_compare)
+        if idx >= 0:
+            self._compare_combo.setCurrentIndex(idx)
+        idx = self._dataset_combo.findText(cur_ds)
+        if idx >= 0:
+            self._dataset_combo.setCurrentIndex(idx)
 
-        chart.addSeries(series)
-        axis_x = QBarCategoryAxis()
-        axis_x.append([d.replace("_", " ").title() for d in datasets])
-        axis_x.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
-        series.attachAxis(axis_x)
-        axis_y = QValueAxis()
-        axis_y.setRange(0, 100)
-        axis_y.setLabelFormat("%d%%")
-        axis_y.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
-        series.attachAxis(axis_y)
-        self.bar_chart_view.setChart(chart)
+        for combo in (self._model_combo, self._compare_combo, self._dataset_combo):
+            combo.blockSignals(False)
 
-    def _update_line_chart(self, prompt_rows: list[dict], cmp_prompt_rows: list[dict]) -> None:
-        chart = QChart()
-        chart.setBackgroundVisible(False)
-        tc = _chart_text_colors()
-        chart.legend().setLabelColor(tc["axis"])
-        chart.setTitleBrush(tc["title"])
-        chart.setTitle("Accuracy by prompt condition (P0\u2013P4), averaged over datasets")
+    def _on_filter_changed(self) -> None:
+        self._update_views()
 
-        if not prompt_rows:
-            self.line_chart_view.setChart(chart)
-            return
+    # ------------------------------------------------------ view filtering
+    def _selected_models(self) -> Optional[list[str]]:
+        """None means 'all models'; otherwise the exact set of model tags
+        to include (primary + comparison model, when one is chosen)."""
+        primary = self._model_combo.currentText()
+        compare = self._compare_combo.currentText()
 
-        conditions = sorted({r["prompt_condition"] for r in prompt_rows if r.get("prompt_condition")})
+        selected: list[str] = []
+        if primary != "All Models":
+            selected.append(primary)
+        if compare != "None" and compare not in selected:
+            selected.append(compare)
 
-        def _series_for(rows: list[dict], name: str, color: QColor) -> QLineSeries:
-            s = QLineSeries()
-            s.setName(name)
-            pen = s.pen()
-            pen.setWidth(3)
-            pen.setColor(color)
-            s.setPen(pen)
-            by_cond: dict[str, list[float]] = {}
-            for r in rows:
-                by_cond.setdefault(r["prompt_condition"], []).append(float(r.get("accuracy", 0) or 0))
-            for i, cond in enumerate(conditions):
-                vals = by_cond.get(cond, [])
-                avg = (sum(vals) / len(vals)) if vals else 0.0
-                s.append(i, avg * 100)
-            return s
+        return selected or None
 
-        primary_series = _series_for(prompt_rows, backend.model_label(self.model_tag), PRIMARY_COLOR)
-        chart.addSeries(primary_series)
+    def _apply_common_filters(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        models = self._selected_models()
+        sel_ds = self._dataset_combo.currentText()
+        sel_src = self._source_combo.currentText()
 
-        if self.compare_tag and cmp_prompt_rows:
-            cmp_series = _series_for(cmp_prompt_rows, backend.model_label(self.compare_tag), COMPARE_COLOR)
-            chart.addSeries(cmp_series)
-
-        axis_x = QBarCategoryAxis()
-        axis_x.append(conditions)
-        axis_x.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
-        axis_y = QValueAxis()
-        axis_y.setRange(0, 100)
-        axis_y.setLabelFormat("%d%%")
-        axis_y.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
-        for s in chart.series():
-            s.attachAxis(axis_x)
-            s.attachAxis(axis_y)
-        self.line_chart_view.setChart(chart)
-
-    def _update_pie_chart(self, rows: list[dict], compare_rows: list[dict]) -> None:
-        chart = QChart()
-        chart.setBackgroundVisible(False)
-        tc = _chart_text_colors()
-        chart.legend().setLabelColor(tc["axis"])
-        chart.setTitleBrush(tc["title"])
-        label = backend.model_label(self.model_tag) if self.model_tag else ""
-        chart.setTitle(f"{label} \u2014 unanimous vs. varying answers across prompts")
-
-        if not rows:
-            self.pie_chart_view.setChart(chart)
-            return
-
-        unanimous = _avg(rows, "answer_unanimous_rate")
-        series = QPieSeries()
-        s1 = series.append("Unanimous across P0\u2013P4", unanimous)
-        s2 = series.append("Varies by prompt", max(0.0, 1 - unanimous))
-        s1.setBrush(PRIMARY_COLOR)
-        s2.setBrush(QColor("#2a2833"))
-        s1.setLabelVisible(True)
-        s2.setLabelVisible(True)
-        series.setHoleSize(0.45)
-        chart.addSeries(series)
-        self.pie_chart_view.setChart(chart)
-
-    def _update_table(self, rows: list[dict], compare_rows: list[dict]) -> None:
-        table = self.detailed_table
-        table.clear()
-        columns = ["model"] + TABLE_COLUMNS
-        all_rows = list(rows) + list(compare_rows)
-        table.setColumnCount(len(columns))
-        table.setRowCount(len(all_rows))
-        table.setHorizontalHeaderLabels([PRETTY.get(c, c.replace("_", " ").title()) for c in columns])
-        table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-
-        for r_idx, row in enumerate(all_rows):
-            for c_idx, col in enumerate(columns):
-                if col == "model":
-                    value = backend.model_label(row.get("model", self.model_tag or ""))
-                else:
-                    value = _fmt(col, row.get(col, ""))
-                item = QTableWidgetItem(value)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-                table.setItem(r_idx, c_idx, item)
-
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setStretchLastSection(True)
-
-    # ---------------- all-model comparison ----------------
-
-    def _all_models_avg(self) -> dict[str, dict[str, float]]:
-        """{model_tag: {metric: dataset-averaged value}} for every locally
-        benchmarked model — used by the scatter chart, all-model bar chart,
-        the leaderboard table, and the PDF export."""
-        data = backend.all_models_dataset_rows(self.conn)
-        out: dict[str, dict[str, float]] = {}
-        for tag, rows in data.items():
-            if not rows:
+        out = []
+        for r in rows:
+            if models is not None and r.get("model") not in models:
                 continue
-            out[tag] = {
-                "prompt_response_accuracy": _avg(rows, "prompt_response_accuracy"),
-                "mean_agreement": _avg(rows, "mean_agreement"),
-                "conditional_accuracy": _avg(rows, "conditional_accuracy"),
-                "instruction_compliance_rate": _avg(rows, "instruction_compliance_rate"),
-                "answer_recovery_rate": _avg(rows, "answer_recovery_rate"),
-                "answer_unanimous_rate": _avg(rows, "answer_unanimous_rate"),
-                "prompt_invariant_incorrect_rate": _avg(rows, "prompt_invariant_incorrect_rate"),
-                "n_questions": sum(int(float(r.get("n_questions", 0) or 0)) for r in rows),
-            }
+            if sel_ds != "All Datasets" and r.get("dataset") != sel_ds:
+                continue
+            if sel_src == "Research Results" and r.get("source") != "Research":
+                continue
+            if sel_src == "User Runs" and r.get("source") != "User Run":
+                continue
+            out.append(r)
         return out
 
-    def _update_scatter_chart(self) -> None:
-        chart = QChart()
-        chart.setBackgroundVisible(False)
-        tc = _chart_text_colors()
-        chart.legend().setLabelColor(tc["axis"])
-        chart.setTitleBrush(tc["title"])
-        chart.setTitle("Accuracy vs. agreement \u2014 every locally benchmarked model")
+    def _filtered_ds_rows(self) -> list[dict[str, Any]]:
+        return self._apply_common_filters(self._ds_rows)
 
-        summary = self._all_models_avg()
-        if not summary:
-            self.scatter_chart_view.setChart(chart)
-            return
+    def _filtered_pr_rows(self) -> list[dict[str, Any]]:
+        return self._apply_common_filters(self._pr_rows)
 
-        axis_x = QValueAxis()
-        axis_x.setRange(0, 100)
-        axis_x.setTitleText("Agreement across P0\u2013P4 (%)")
-        axis_x.setLabelsColor(tc["axis"])
-        axis_y = QValueAxis()
-        axis_y.setRange(0, 100)
-        axis_y.setTitleText("Accuracy (%)")
-        axis_y.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
-        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+    def _update_views(self) -> None:
+        ds_filtered = self._filtered_ds_rows()
+        pr_filtered = self._filtered_pr_rows()
 
-        for i, (tag, m) in enumerate(summary.items()):
-            s = QScatterSeries()
-            s.setName(backend.model_label(tag))
-            s.setMarkerSize(18.0)
-            s.setColor(_color_for(i))
-            s.append(m["mean_agreement"] * 100, m["prompt_response_accuracy"] * 100)
-            chart.addSeries(s)
-            s.attachAxis(axis_x)
-            s.attachAxis(axis_y)
+        self._update_kpi_cards(ds_filtered)
+        if HAS_CHARTS:
+            self._update_charts(ds_filtered, pr_filtered)
+        self._update_table(ds_filtered)
 
-        self.scatter_chart_view.setChart(chart)
-
-    def _update_allmodel_bar_chart(self) -> None:
-        chart = QChart()
-        chart.setBackgroundVisible(False)
-        tc = _chart_text_colors()
-        chart.legend().setLabelColor(tc["axis"])
-        chart.setTitleBrush(tc["title"])
-        chart.setTitle("Accuracy, agreement & compliance \u2014 all locally benchmarked models")
-
-        summary = self._all_models_avg()
-        if not summary:
-            self.allmodel_bar_view.setChart(chart)
-            return
-
-        tags = list(summary.keys())
-        labels = [backend.model_label(t) for t in tags]
-
-        series = QBarSeries()
-        acc_set = QBarSet("Accuracy")
-        acc_set.setColor(PRIMARY_COLOR)
-        agree_set = QBarSet("Agreement")
-        agree_set.setColor(QColor("#5fd18e"))
-        compliance_set = QBarSet("Instr. compliance")
-        compliance_set.setColor(QColor("#e8b45c"))
-        for t in tags:
-            m = summary[t]
-            acc_set.append(m["prompt_response_accuracy"] * 100)
-            agree_set.append(m["mean_agreement"] * 100)
-            compliance_set.append(m["instruction_compliance_rate"] * 100)
-        series.append(acc_set)
-        series.append(agree_set)
-        series.append(compliance_set)
-        chart.addSeries(series)
-
-        axis_x = QBarCategoryAxis()
-        axis_x.append(labels)
-        axis_x.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
-        series.attachAxis(axis_x)
-        axis_y = QValueAxis()
-        axis_y.setRange(0, 100)
-        axis_y.setLabelFormat("%d%%")
-        axis_y.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
-        series.attachAxis(axis_y)
-        self.allmodel_bar_view.setChart(chart)
-
-    def _update_leaderboard_table(self) -> None:
-        table = self.leaderboard_table
-        table.clear()
-        summary = self._all_models_avg()
-        columns = [
-            "model", "n_questions", "prompt_response_accuracy", "mean_agreement",
-            "conditional_accuracy", "instruction_compliance_rate",
-            "answer_recovery_rate", "answer_unanimous_rate",
-            "prompt_invariant_incorrect_rate",
-        ]
-        headers = [
-            "Model", "Questions", "Accuracy", "Agreement", "Cond. accuracy",
-            "Instr. compliance", "Recovery rate", "Unanimous rate", "Invariant-incorrect",
-        ]
-        # rank models best-accuracy-first so the leaderboard reads top to bottom
-        ordered = sorted(summary.items(), key=lambda kv: kv[1]["prompt_response_accuracy"], reverse=True)
-
-        table.setColumnCount(len(columns))
-        table.setRowCount(len(ordered))
-        table.setHorizontalHeaderLabels(headers)
-        table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-
-        # best value per metric gets highlighted so the table doubles as a
-        # quick "who wins on what" view, not just raw numbers.
-        best_col: dict[str, float] = {}
-        worse_is_better = {"prompt_invariant_incorrect_rate"}
-        for col in columns[2:]:
-            vals = [m[col] for _, m in ordered]
-            if not vals:
-                continue
-            best_col[col] = min(vals) if col in worse_is_better else max(vals)
-
-        for r_idx, (tag, m) in enumerate(ordered):
-            rank_prefix = f"#{r_idx + 1} \u00b7 " if r_idx < 3 else ""
-            values = [rank_prefix + backend.model_label(tag), str(m["n_questions"])]
-            values += [f"{m[c] * 100:.1f}%" for c in columns[2:]]
-            for c_idx, val in enumerate(values):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-                col_key = columns[c_idx]
-                if col_key in best_col and abs(m.get(col_key, -1) - best_col[col_key]) < 1e-9:
-                    item.setForeground(QColor("#5fd18e"))
-                table.setItem(r_idx, c_idx, item)
-
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setStretchLastSection(True)
-
-    def _update_detail_chart(self, rows: list[dict], compare_rows: list[dict]) -> None:
-        """Grouped bar sitting above the Detailed table \u2014 accuracy, agreement
-        and recovery rate per dataset for the active model (+ compare model
-        if one is selected), so the raw numbers below always have a picture
-        to go with them."""
-        chart = QChart()
-        chart.setBackgroundVisible(False)
-        tc = _chart_text_colors()
-        chart.legend().setLabelColor(tc["axis"])
-        chart.setTitleBrush(tc["title"])
-        chart.setTitle("Dataset breakdown \u2014 accuracy, agreement, recovery")
-
+    def _update_kpi_cards(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
-            self.detail_chart_view.setChart(chart)
+            for kpi in (self._kpi_acc, self._kpi_agree, self._kpi_sens,
+                        self._kpi_comp, self._kpi_rec, self._kpi_unk):
+                kpi.set_data("-", "No data matching filter")
             return
 
-        datasets = sorted({r["dataset"] for r in rows} | {r["dataset"] for r in compare_rows})
-        by_ds = {r["dataset"]: r for r in rows}
-        cmp_by_ds = {r["dataset"]: r for r in compare_rows}
-        label = backend.model_label(self.model_tag) if self.model_tag else ""
+        n = len(rows)
+        avg_acc = sum(_f(r.get("prompt_response_accuracy")) for r in rows) / n
+        avg_agree = sum(_f(r.get("mean_agreement")) for r in rows) / n
+        avg_sens = sum(_f(r.get("mean_prompt_sensitivity")) for r in rows) / n
+        avg_comp = sum(_f(r.get("instruction_compliance_rate")) for r in rows) / n
+        avg_rec = sum(_f(r.get("answer_recovery_rate")) for r in rows) / n
+        avg_unk = sum(_f(r.get("unknown_rate")) for r in rows) / n
 
-        series = QBarSeries()
-        metrics = [
-            ("prompt_response_accuracy", "Accuracy"),
-            ("mean_agreement", "Agreement"),
-            ("answer_recovery_rate", "Recovery"),
-        ]
-        colors = [PRIMARY_COLOR, QColor("#5fd18e"), QColor("#e8b45c")]
-        for (key, name), color in zip(metrics, colors):
-            bset = QBarSet(f"{label} \u00b7 {name}")
-            bset.setColor(color)
-            for d in datasets:
-                bset.append(float(by_ds.get(d, {}).get(key, 0) or 0) * 100)
-            series.append(bset)
+        compare_active = self._compare_combo.currentText() != "None"
+        context_str = (
+            f"Comparing {n} evaluation slice(s)" if compare_active
+            else f"Across {n} evaluation slice(s)"
+        )
+        self._kpi_acc.set_data(_pct(avg_acc), context_str)
+        self._kpi_agree.set_data(_pct(avg_agree), context_str)
+        self._kpi_sens.set_data(_pct(avg_sens), context_str)
+        self._kpi_comp.set_data(_pct(avg_comp), context_str)
+        self._kpi_rec.set_data(_pct(avg_rec), context_str)
+        self._kpi_unk.set_data(_pct(avg_unk), context_str)
 
-        if self.compare_tag and compare_rows:
-            cmp_label = backend.model_label(self.compare_tag)
-            cmp_acc = QBarSet(f"{cmp_label} \u00b7 Accuracy")
-            cmp_acc.setColor(COMPARE_COLOR.darker(120))
-            for d in datasets:
-                cmp_acc.append(float(cmp_by_ds.get(d, {}).get("prompt_response_accuracy", 0) or 0) * 100)
-            series.append(cmp_acc)
+    def _update_charts(self, ds_rows: list[dict[str, Any]], pr_rows: list[dict[str, Any]]) -> None:
+        _clear_layout(self._charts_grid)
+        if not ds_rows:
+            return
 
-        chart.addSeries(series)
-        axis_x = QBarCategoryAxis()
-        axis_x.append([d.replace("_", " ").title() for d in datasets])
-        axis_x.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
-        series.attachAxis(axis_x)
-        axis_y = QValueAxis()
-        axis_y.setRange(0, 100)
-        axis_y.setLabelFormat("%d%%")
-        axis_y.setLabelsColor(tc["axis"])
-        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
-        series.attachAxis(axis_y)
-        self.detail_chart_view.setChart(chart)
+        datasets = sorted({r.get("dataset", "") for r in ds_rows})
+        models = sorted({r.get("model", "") for r in ds_rows})
 
-    def _update_leaderboard_chart(self) -> None:
-        """Horizontal-reading ranked bar above the Leaderboard table \u2014
-        every locally benchmarked model's accuracy, sorted best to worst."""
+        if models and datasets:
+            series_acc = {}
+            for ds in datasets:
+                ds_map = {r.get("model"): _f(r.get("prompt_response_accuracy")) for r in ds_rows if r.get("dataset") == ds}
+                series_acc[ds] = [ds_map.get(m, 0.0) for m in models]
+
+            self._charts_grid.addWidget(
+                self._create_bar_chart("Model Accuracy Comparison", models, series_acc), 0, 0,
+            )
+
+            series_outcome = {
+                "Unanimous Correct": [],
+                "Invariant Incorrect": [],
+                "Prompt-Variable": [],
+            }
+            for ds in datasets:
+                d_rows = [r for r in ds_rows if r.get("dataset") == ds]
+                if d_rows:
+                    unanimous = sum(_f(r.get("answer_unanimous_rate")) for r in d_rows) / len(d_rows)
+                    invariant_wrong = sum(_f(r.get("prompt_invariant_incorrect_rate")) for r in d_rows) / len(d_rows)
+                    variable = max(0.0, 1.0 - unanimous - invariant_wrong)
+                else:
+                    unanimous = invariant_wrong = variable = 0.0
+                series_outcome["Unanimous Correct"].append(unanimous)
+                series_outcome["Invariant Incorrect"].append(invariant_wrong)
+                series_outcome["Prompt-Variable"].append(variable)
+
+            self._charts_grid.addWidget(
+                self._create_bar_chart("Question Outcome Profile", datasets, series_outcome), 0, 1,
+            )
+
+        if pr_rows:
+            conditions = list(config.PROMPT_CONDITIONS)
+            pr_by_model: dict[str, list[float]] = {}
+            for m in models:
+                m_pr = [r for r in pr_rows if r.get("model") == m]
+                if m_pr:
+                    cond_accs = []
+                    for c in conditions:
+                        c_rows = [r for r in m_pr if r.get("prompt_condition") == c]
+                        val = sum(_f(r.get("accuracy")) for r in c_rows) / len(c_rows) if c_rows else 0.0
+                        cond_accs.append(val)
+                    pr_by_model[m] = cond_accs
+
+            if pr_by_model:
+                self._charts_grid.addWidget(
+                    self._create_line_chart("Accuracy by Prompt Condition (P0-P4)", conditions, pr_by_model), 1, 0,
+                )
+
+            comp_series = {}
+            for ds in datasets:
+                ds_map = {r.get("model"): _f(r.get("instruction_compliance_rate")) for r in ds_rows if r.get("dataset") == ds}
+                comp_series[ds] = [ds_map.get(m, 0.0) for m in models]
+
+            self._charts_grid.addWidget(
+                self._create_bar_chart("Instruction Compliance Rate", models, comp_series), 1, 1,
+            )
+
+    def _create_bar_chart(
+        self, title: str, categories: list[str], series_map: dict[str, list[float]]
+    ) -> "QChartView":
+        p = _active_palette()
+        chart_series = _chart_series(p)
         chart = QChart()
-        chart.setBackgroundVisible(False)
-        tc = _chart_text_colors()
-        chart.legend().setLabelColor(tc["axis"])
-        chart.setTitleBrush(tc["title"])
-        chart.setTitle("Leaderboard \u2014 accuracy, ranked")
-
-        summary = self._all_models_avg()
-        if not summary:
-            self.leaderboard_chart_view.setChart(chart)
-            return
-
-        ordered = sorted(summary.items(), key=lambda kv: kv[1]["prompt_response_accuracy"], reverse=True)
-        labels = [backend.model_label(tag) for tag, _ in ordered]
+        chart.setTitle(title)
+        chart.setBackgroundBrush(QBrush(QColor(p.surface_raised)))
+        chart.setBackgroundPen(QPen(Qt.PenStyle.NoPen))
+        chart.setPlotAreaBackgroundVisible(False)
+        chart.setTitleBrush(QBrush(QColor(p.text)))
 
         series = QBarSeries()
-        acc_set = QBarSet("Accuracy")
-        acc_set.setColor(PRIMARY_COLOR)
-        agree_set = QBarSet("Agreement")
-        agree_set.setColor(QColor("#5fd18e"))
-        for _, m in ordered:
-            acc_set.append(m["prompt_response_accuracy"] * 100)
-            agree_set.append(m["mean_agreement"] * 100)
-        series.append(acc_set)
-        series.append(agree_set)
+        for i, (name, values) in enumerate(series_map.items()):
+            bar_set = QBarSet(name)
+            for val in values:
+                bar_set.append(val)
+            bar_set.setColor(QColor(chart_series[i % len(chart_series)]))
+            bar_set.setBorderColor(QColor(p.surface_raised))
+            series.append(bar_set)
         chart.addSeries(series)
 
         axis_x = QBarCategoryAxis()
-        axis_x.append(labels)
-        axis_x.setLabelsColor(tc["axis"])
+        axis_x.append(categories)
+        axis_x.setLabelsColor(QColor(p.text_dim))
+        axis_x.setLinePen(QPen(QColor(p.hairline)))
+        axis_x.setGridLineVisible(False)
         chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
         series.attachAxis(axis_x)
+
         axis_y = QValueAxis()
-        axis_y.setRange(0, 100)
-        axis_y.setLabelFormat("%d%%")
-        axis_y.setLabelsColor(tc["axis"])
+        axis_y.setRange(0.0, 1.0)
+        axis_y.setLabelFormat("%.2f")
+        axis_y.setLabelsColor(QColor(p.text_dim))
+        axis_y.setLinePen(QPen(QColor(p.hairline)))
+        axis_y.setGridLinePen(QPen(QColor(p.hairline)))
         chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
         series.attachAxis(axis_y)
-        self.leaderboard_chart_view.setChart(chart)
 
-    # ---------------- PDF export ----------------
+        chart.legend().setVisible(True)
+        chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        chart.legend().setLabelColor(QColor(p.text))
 
-    def _export_pdf(self) -> None:
-        if not self.model_tag:
-            QMessageBox.information(self, "No model selected",
-                                     "Pick a model and run a benchmark before exporting a summary.")
+        view = QChartView(chart)
+        view.setFrameShape(QFrame.Shape.NoFrame)
+        view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        view.setBackgroundBrush(QBrush(QColor(p.surface_raised)))
+        view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        view.setMinimumHeight(270)
+        return view
+
+    def _create_line_chart(
+        self, title: str, categories: list[str], series_map: dict[str, list[float]]
+    ) -> "QChartView":
+        """Line-chart variant of ``_create_bar_chart``, used for the
+        accuracy-by-prompt-condition view: one line per model, with a
+        marker on every prompt condition, so it's easy to see whether a
+        model rises, falls, or stays flat across P0-P4."""
+        p = _active_palette()
+        chart_series = _chart_series(p)
+        chart = QChart()
+        chart.setTitle(title)
+        chart.setBackgroundBrush(QBrush(QColor(p.surface_raised)))
+        chart.setBackgroundPen(QPen(Qt.PenStyle.NoPen))
+        chart.setPlotAreaBackgroundVisible(False)
+        chart.setTitleBrush(QBrush(QColor(p.text)))
+
+        axis_x = QBarCategoryAxis()
+        axis_x.append(categories)
+        axis_x.setLabelsColor(QColor(p.text_dim))
+        axis_x.setLinePen(QPen(QColor(p.hairline)))
+        axis_x.setGridLineVisible(False)
+
+        axis_y = QValueAxis()
+        axis_y.setRange(0.0, 1.0)
+        axis_y.setLabelFormat("%.2f")
+        axis_y.setLabelsColor(QColor(p.text_dim))
+        axis_y.setLinePen(QPen(QColor(p.hairline)))
+        axis_y.setGridLinePen(QPen(QColor(p.hairline)))
+        chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+
+        for i, (name, values) in enumerate(series_map.items()):
+            line = QLineSeries()
+            line.setName(name)
+            color = QColor(chart_series[i % len(chart_series)])
+            pen = QPen(color)
+            pen.setWidth(2)
+            line.setPen(pen)
+            line.setPointsVisible(True)  # mark each prompt condition with a point
+            for x, val in enumerate(values):
+                line.append(float(x), val)
+            chart.addSeries(line)
+            line.attachAxis(axis_x)
+            line.attachAxis(axis_y)
+
+        chart.legend().setVisible(True)
+        chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        chart.legend().setLabelColor(QColor(p.text))
+
+        view = QChartView(chart)
+        view.setFrameShape(QFrame.Shape.NoFrame)
+        view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        view.setBackgroundBrush(QBrush(QColor(p.surface_raised)))
+        view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        view.setMinimumHeight(270)
+        return view
+
+    def _num_item(self, val: float) -> QTableWidgetItem:
+        item = QTableWidgetItem()
+        item.setData(Qt.ItemDataRole.DisplayRole, round(val, 3))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return item
+
+    def _update_table(self, rows: list[dict[str, Any]]) -> None:
+        headers = [
+            "Source", "Model", "Dataset", "Questions", "Accuracy", "Cond. Acc",
+            "Agreement", "Sensitivity", "Compliance", "Recovery", "Unknown", "Invariant Wrong",
+        ]
+
+        table = self._table
+        table.setSortingEnabled(False)
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+
+        for r, row in enumerate(rows):
+            col = 0
+            table.setItem(r, col, QTableWidgetItem(str(row.get("source", "")))); col += 1
+            table.setItem(r, col, QTableWidgetItem(str(row.get("model", "")))); col += 1
+            table.setItem(r, col, QTableWidgetItem(str(row.get("dataset", "")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("n_questions")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("prompt_response_accuracy")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("conditional_accuracy")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("mean_agreement")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("mean_prompt_sensitivity")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("instruction_compliance_rate")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("answer_recovery_rate")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("unknown_rate")))); col += 1
+            table.setItem(r, col, self._num_item(_f(row.get("prompt_invariant_incorrect_rate")))); col += 1
+
+        table.setSortingEnabled(True)
+
+    # --------------------------------------------------------- PDF export
+    def _chart_pixmaps(self) -> list[tuple[str, Any]]:
+        """Grab the currently rendered chart views as (title, QPixmap) pairs,
+        in the same order they're laid out on screen, so the exported PDF
+        matches what's on screen when the user clicks the button."""
+        if not HAS_CHARTS:
+            return []
+        grabs: list[tuple[str, Any]] = []
+        for i in range(self._charts_grid.count()):
+            item = self._charts_grid.itemAt(i)
+            view = item.widget() if item is not None else None
+            if isinstance(view, QChartView):
+                title = view.chart().title() or "Chart"
+                grabs.append((title, view.grab()))
+        return grabs
+
+    def _leaderboard(self, conn: sqlite3.Connection) -> dict[str, dict[str, float]]:
+        """Average dataset-level metrics per model, across ALL locally
+        available data (not the current filter), for the report's
+        cross-model leaderboard page."""
+        board: dict[str, dict[str, float]] = {}
+        for tag, rows in backend.all_models_dataset_rows(conn).items():
+            if not rows:
+                continue
+            n = len(rows)
+            board[tag] = {
+                "n_questions": sum(_f(r.get("n_questions")) for r in rows),
+                "prompt_response_accuracy": sum(_f(r.get("prompt_response_accuracy")) for r in rows) / n,
+                "mean_agreement": sum(_f(r.get("mean_agreement")) for r in rows) / n,
+                "instruction_compliance_rate": sum(_f(r.get("instruction_compliance_rate")) for r in rows) / n,
+                "prompt_invariant_incorrect_rate": sum(_f(r.get("prompt_invariant_incorrect_rate")) for r in rows) / n,
+            }
+        return board
+
+    def _on_download_pdf(self) -> None:
+        primary = self._model_combo.currentText()
+        if not primary or primary == "All Models":
+            QMessageBox.information(
+                self, "Select a model",
+                "Choose a specific model in the \u201cModel\u201d filter above before "
+                "downloading a PDF summary - the report is scoped to one model "
+                "at a time (with an optional comparison model).",
+            )
             return
 
-        default_name = f"prism_summary_{self.model_tag.replace(':', '_').replace('/', '_')}.pdf"
-        path, _ = QFileDialog.getSaveFileName(self, "Save PDF summary", default_name, "PDF files (*.pdf)")
-        if not path:
-            return
+        compare = self._compare_combo.currentText()
+        compare_active = compare not in ("None", "")
 
-        rows = backend.model_dataset_rows(self.conn, self.model_tag)
-        prompt_rows = backend.model_prompt_rows(self.conn, self.model_tag)
-        info = backend.run_info(self.conn, self.model_tag)
+        ds_rows = [r for r in self._filtered_ds_rows() if r.get("model") == primary]
+        pr_rows = [r for r in self._filtered_pr_rows() if r.get("model") == primary]
         compare_rows = (
-            backend.model_dataset_rows(self.conn, self.compare_tag)
-            if (self.compare_tag and self.show_compare) else []
+            [r for r in self._filtered_ds_rows() if r.get("model") == compare]
+            if compare_active else []
         )
 
-        # grab the currently-rendered charts as images so the PDF mirrors
-        # what's actually on screen, not a re-derived version of it
-        chart_images = []
-        for title, view in (
-            ("Metrics by dataset", self.bar_chart_view),
-            ("Accuracy by prompt condition", self.line_chart_view),
-            ("Answer consistency", self.pie_chart_view),
-            ("Accuracy vs. agreement (all models)", self.scatter_chart_view),
-            ("All models \u2014 accuracy", self.allmodel_bar_view),
-            ("Dataset breakdown", self.detail_chart_view),
-            ("Leaderboard \u2014 accuracy, ranked", self.leaderboard_chart_view),
-        ):
-            pixmap = view.grab()
-            if not pixmap.isNull():
-                chart_images.append((title, pixmap))
+        default_name = f"PRISM_{primary.replace(':', '_').replace('/', '_')}_summary.pdf"
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Download PDF summary", default_name, "PDF files (*.pdf)",
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".pdf"):
+            out_path += ".pdf"
+
+        conn = backend.get_conn()
+        try:
+            info = backend.run_info(conn, primary) or {}
+            leaderboard = self._leaderboard(conn)
+        finally:
+            conn.close()
 
         try:
             pdf_report.build_model_summary_pdf(
-                path,
-                model_label=backend.model_label(self.model_tag),
-                model_tag=self.model_tag,
-                run_info=info or {},
-                dataset_rows=rows,
-                prompt_rows=prompt_rows,
-                compare_label=backend.model_label(self.compare_tag) if (self.compare_tag and self.show_compare) else None,
+                out_path,
+                model_label=backend.model_label(primary),
+                model_tag=primary,
+                run_info=info,
+                dataset_rows=ds_rows,
+                prompt_rows=pr_rows,
+                compare_label=backend.model_label(compare) if compare_active else None,
                 compare_rows=compare_rows,
-                leaderboard=self._all_models_avg(),
-                chart_images=chart_images,
+                leaderboard=leaderboard,
+                chart_images=self._chart_pixmaps(),
             )
-        except Exception as exc:  # noqa: BLE001 - surface any export error to the user
-            QMessageBox.warning(self, "Export failed", f"Could not write PDF:\n{exc}")
+        except Exception as exc:  # noqa: BLE001 - surface any export failure to the user
+            QMessageBox.critical(self, "Export failed", f"Couldn't write the PDF:\n{exc}")
             return
 
-        QMessageBox.information(self, "Summary exported", f"PDF summary saved to:\n{path}")
+        QMessageBox.information(self, "PDF saved", f"Summary saved to:\n{out_path}")
+
+    # ------------------------------------------------- external hooks
+    def set_active_model(self, model_tag: str) -> None:
+        """Called by MainWindow when the active model changes elsewhere in
+        the app (e.g. after a benchmark run finishes) so the dashboard's
+        primary filter follows it."""
+        idx = self._model_combo.findText(model_tag)
+        if idx >= 0:
+            self._model_combo.setCurrentIndex(idx)
+
+    # Aliases matching the method names MainWindow calls.
+    def refresh(self) -> None:
+        self.reload_data()
+
+    def set_model(self, model_tag: str) -> None:
+        self.set_active_model(model_tag)
