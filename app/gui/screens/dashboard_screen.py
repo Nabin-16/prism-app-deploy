@@ -724,15 +724,18 @@ class DashboardScreen(QWidget):
             }
         return board
 
+    @staticmethod
+    def _pdf_filename_part(text: str) -> str:
+        """Sanitize a model label/tag for use inside a PDF filename."""
+        return text.replace(':', '_').replace('/', '_').replace(' ', '_')
+
     def _on_download_pdf(self) -> None:
         primary = self._model_combo.currentText()
-        if not primary or primary == "All Models":
-            QMessageBox.information(
-                self, "Select a model",
-                "Choose a specific model in the \u201cModel\u201d filter above before "
-                "downloading a PDF summary - the report is scoped to one model "
-                "at a time (with an optional comparison model).",
-            )
+        if not primary:
+            return
+
+        if primary == "All Models":
+            self._download_all_models_pdf()
             return
 
         compare = self._compare_combo.currentText()
@@ -745,20 +748,22 @@ class DashboardScreen(QWidget):
             if compare_active else []
         )
 
-        default_name = f"PRISM_{primary.replace(':', '_').replace('/', '_')}_summary.pdf"
+        # Comparison reports get their own naming pattern ("X_vs_Y_comparison")
+        # rather than "X_summary", so a folder full of downloaded PDFs makes
+        # it obvious at a glance which files are single-model summaries and
+        # which are head-to-head comparisons.
+        if compare_active:
+            default_name = (
+                f"PRISM_{self._pdf_filename_part(primary)}"
+                f"_vs_{self._pdf_filename_part(compare)}_comparison.pdf"
+            )
+        else:
+            default_name = f"PRISM_{self._pdf_filename_part(primary)}_summary.pdf"
 
         # QFileDialog's "dir" argument needs an actual directory, not a bare
-        # filename - passing just ``default_name`` leaves Qt to fall back to
-        # the process's current working directory, which for an installed
-        # desktop app is the app's own folder rather than anywhere the user
-        # would expect a downloaded file to land. Anchor it to the user's
-        # Documents folder (falling back to their home directory) so the
-        # dialog always opens somewhere on the user's own filesystem, and
-        # the PDF is written straight there - never into the app's install
-        # directory - regardless of what the user picks.
-        docs_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
-        default_dir = Path(docs_dir) if docs_dir else Path.home()
-        default_path = default_dir / default_name
+        # filename - see ``_default_save_path`` for why this can't just be
+        # a bare filename passed to ``QFileDialog``.
+        default_path = self._default_save_path(default_name)
 
         out_path, _ = QFileDialog.getSaveFileName(
             self, "Download PDF summary", str(default_path), "PDF files (*.pdf)",
@@ -793,6 +798,55 @@ class DashboardScreen(QWidget):
             return
 
         QMessageBox.information(self, "PDF saved", f"Summary saved to:\n{out_path}")
+
+    def _download_all_models_pdf(self) -> None:
+        """Separate "All Models" PDF, only reachable when the "Model"
+        filter is set to "All Models" - the full per-model/per-dataset
+        table lives here and nowhere else, so a single-model summary PDF
+        never carries every other model's data along with it."""
+        default_path = self._default_save_path("PRISM_All_Models_summary.pdf")
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Download PDF summary", str(default_path), "PDF files (*.pdf)",
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".pdf"):
+            out_path += ".pdf"
+
+        conn = backend.get_conn()
+        try:
+            leaderboard = self._leaderboard(conn)
+            all_rows: list[dict[str, Any]] = []
+            for tag, rows in backend.all_models_dataset_rows(conn).items():
+                label = backend.model_label(tag)
+                all_rows.extend({**r, "_model_label": label} for r in rows)
+            all_rows.sort(key=lambda r: (str(r.get("_model_label", "")), str(r.get("dataset", ""))))
+        finally:
+            conn.close()
+
+        try:
+            pdf_report.build_all_models_summary_pdf(
+                out_path,
+                all_rows=all_rows,
+                leaderboard=leaderboard,
+                chart_images=self._chart_pixmaps(),
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any export failure to the user
+            QMessageBox.critical(self, "Export failed", f"Couldn't write the PDF:\n{exc}")
+            return
+
+        QMessageBox.information(self, "PDF saved", f"Summary saved to:\n{out_path}")
+
+    def _default_save_path(self, default_name: str) -> Path:
+        """Documents folder (falling back to home) + the given filename -
+        factored out of ``_on_download_pdf`` so both the single/comparison
+        and All Models save flows anchor to the same place. See that
+        method's original comment for why this can't just be a bare
+        filename passed to ``QFileDialog``."""
+        docs_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        default_dir = Path(docs_dir) if docs_dir else Path.home()
+        return default_dir / default_name
 
     # ------------------------------------------------- external hooks
     def set_active_model(self, model_tag: str) -> None:

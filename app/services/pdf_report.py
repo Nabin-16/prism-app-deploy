@@ -19,6 +19,18 @@ Layout, in order:
 5. Chart images grabbed live from the Dashboard's on-screen charts, so the
    PDF matches what the user was looking at when they clicked "Download PDF".
 6. A cross-model leaderboard, for context beyond the one/two models above.
+7. Conclusion - a short, plain-language paragraph restating the report's
+   own headline numbers (never a new metric): the primary model's
+   accuracy/compliance, how it compared to the comparison model when one
+   is selected, and where it sits on the full leaderboard.
+
+A separate entry point, :func:`build_all_models_summary_pdf`, covers the
+"All Models" case (no single primary model selected): letterhead, an
+aggregate KPI strip, one combined dataset-level table across every locally
+available model, the leaderboard, and its own conclusion - the same visual
+language as the single/comparison report above, just scoped to everything
+instead of one or two models. The full per-model, per-dataset data table
+only ever appears in *that* report, never bundled into a single-model PDF.
 
 Every table is set to the document's full usable width (no more tiny
 left-aligned islands with dead space to the right), every page carries a
@@ -184,35 +196,17 @@ def _fractions_to_widths(fractions: list[float], width: float) -> list[float]:
     return [width * f for f in fractions]
 
 
-def _kpi_strip(dataset_rows: list[dict[str, Any]], width: float, styles: dict[str, ParagraphStyle]) -> Optional[Table]:
-    """Four headline numbers up top so the reader gets the takeaway before
-    any table - the kind of at-a-glance summary a benchmark report should
-    lead with, not bury under raw rows."""
-    if not dataset_rows:
-        return None
-
-    n_datasets = len(dataset_rows)
-    total_q = sum(_f(r.get("n_questions")) for r in dataset_rows)
-    if total_q > 0:
-        accuracy = sum(_f(r.get("prompt_response_accuracy")) * _f(r.get("n_questions")) for r in dataset_rows) / total_q
-        compliance = sum(_f(r.get("instruction_compliance_rate")) * _f(r.get("n_questions")) for r in dataset_rows) / total_q
-    else:
-        accuracy = compliance = 0.0
-
-    cards = [
-        (str(n_datasets), "Datasets"),
-        (str(int(total_q)), "Questions"),
-        (_pct(accuracy), "Accuracy"),
-        (_pct(compliance), "Compliance"),
-    ]
-
+def _kpi_card_table(cards: list[tuple[str, str]], width: float, styles: dict[str, ParagraphStyle]) -> Table:
+    """Shared renderer for the headline KPI strip - four (value, label)
+    cards laid out identically whether they summarize one model or all of
+    them, so both report types read as the same visual language."""
     cells = [[
         Paragraph(f"<b>{value}</b>", styles["kpi_value"]),
     ] for value, _label in cards]
     label_cells = [Paragraph(label.upper(), styles["kpi_label"]) for _value, label in cards]
 
     data = [[c[0] for c in cells], label_cells]
-    table = Table(data, colWidths=[width / 4] * 4, rowHeights=[30, 16])
+    table = Table(data, colWidths=[width / len(cards)] * len(cards), rowHeights=[30, 16])
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), _ACCENT_SOFT),
         ("BOX", (0, 0), (-1, -1), 0.75, _HAIRLINE),
@@ -224,6 +218,48 @@ def _kpi_strip(dataset_rows: list[dict[str, Any]], width: float, styles: dict[st
         ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
     ]))
     return table
+
+
+def _kpi_strip(dataset_rows: list[dict[str, Any]], width: float, styles: dict[str, ParagraphStyle]) -> Optional[Table]:
+    """Four headline numbers up top so the reader gets the takeaway before
+    any table - the kind of at-a-glance summary a benchmark report should
+    lead with, not bury under raw rows."""
+    if not dataset_rows:
+        return None
+
+    n_datasets = len(dataset_rows)
+    accuracy, compliance = _weighted_accuracy(dataset_rows)
+    total_q = sum(_f(r.get("n_questions")) for r in dataset_rows)
+
+    cards = [
+        (str(n_datasets), "Datasets"),
+        (str(int(total_q)), "Questions"),
+        (_pct(accuracy), "Accuracy"),
+        (_pct(compliance), "Compliance"),
+    ]
+    return _kpi_card_table(cards, width, styles)
+
+
+def _all_models_kpi_strip(
+    rows: list[dict[str, Any]], n_models: int, width: float, styles: dict[str, ParagraphStyle],
+) -> Optional[Table]:
+    """Same four-card KPI strip as the single-model report, but scoped to
+    every model at once: model count and distinct dataset count in place
+    of a single model's dataset count, then the same weighted accuracy/
+    compliance figures across all of it."""
+    if not rows:
+        return None
+
+    n_datasets = len({str(r.get("dataset", "")) for r in rows})
+    accuracy, compliance = _weighted_accuracy(rows)
+
+    cards = [
+        (str(n_models), "Models"),
+        (str(n_datasets), "Datasets"),
+        (_pct(accuracy), "Accuracy"),
+        (_pct(compliance), "Compliance"),
+    ]
+    return _kpi_card_table(cards, width, styles)
 
 
 def _metrics_table(rows: list[dict[str, Any]], width: float, *, show_model_col: bool) -> Table:
@@ -314,6 +350,15 @@ def _prompt_table(rows: list[dict[str, Any]], width: float) -> Table:
     return table
 
 
+def _all_models_table(rows: list[dict[str, Any]], width: float) -> Table:
+    """Full per-(model, dataset) data for every locally available model -
+    the detailed backing data behind the aggregate leaderboard above it.
+    Reuses ``_metrics_table``'s column set/widths/styling verbatim (same
+    headers, same fractions, same ``_table_style``) so this reads as the
+    same table simply carrying more rows, not a different-looking one."""
+    return _metrics_table(rows, width, show_model_col=True)
+
+
 def _leaderboard_table(leaderboard: dict[str, dict[str, float]], width: float) -> Table:
     headers = ["Model", "Questions", "Accuracy", "Agreement", "Compliance", "Inv. Wrong"]
     fractions = [0.24, 0.14, 0.155, 0.155, 0.155, 0.155]
@@ -358,6 +403,72 @@ def _pixmap_to_image_flowable(pixmap: Any, *, max_width: float) -> Optional[Imag
     img.drawWidth = img.imageWidth * scale
     img.drawHeight = img.imageHeight * scale
     return img
+
+
+def _weighted_accuracy(rows: list[dict[str, Any]]) -> tuple[float, float]:
+    """Question-weighted (accuracy, compliance) across a set of dataset
+    rows - the same weighting ``_kpi_strip`` uses, factored out so the
+    conclusion can quote the identical numbers the KPI strip showed."""
+    total_q = sum(_f(r.get("n_questions")) for r in rows)
+    if total_q <= 0:
+        return 0.0, 0.0
+    accuracy = sum(_f(r.get("prompt_response_accuracy")) * _f(r.get("n_questions")) for r in rows) / total_q
+    compliance = sum(_f(r.get("instruction_compliance_rate")) * _f(r.get("n_questions")) for r in rows) / total_q
+    return accuracy, compliance
+
+
+def _conclusion_paragraphs(
+    model_label: str,
+    dataset_rows: list[dict[str, Any]],
+    compare_label: Optional[str],
+    compare_rows: Optional[list[dict[str, Any]]],
+    leaderboard: Optional[dict[str, dict[str, float]]],
+    styles: dict[str, ParagraphStyle],
+) -> list[Any]:
+    """Plain-language wrap-up of the report's own numbers - never a new
+    metric, always a restatement of figures already shown above so the
+    reader leaves with a takeaway instead of just a stack of tables."""
+    sentences: list[str] = []
+
+    acc, compliance = _weighted_accuracy(dataset_rows)
+    if dataset_rows:
+        sentences.append(
+            f"<b>{model_label}</b> scored {_pct(acc)} accuracy and {_pct(compliance)} instruction "
+            f"compliance across {len(dataset_rows)} dataset(s) in this run."
+        )
+    else:
+        sentences.append(f"No dataset-level results were available for <b>{model_label}</b> in this run.")
+
+    compare_active = bool(compare_label and compare_rows)
+    if compare_active:
+        c_acc, c_compliance = _weighted_accuracy(compare_rows or [])
+        diff = acc - c_acc
+        if abs(diff) < 0.005:
+            sentences.append(
+                f"Against <b>{compare_label}</b> ({_pct(c_acc)} accuracy), the two models performed "
+                "about the same overall."
+            )
+        else:
+            better, worse, gap = (model_label, compare_label, diff) if diff > 0 else (compare_label, model_label, -diff)
+            sentences.append(
+                f"<b>{better}</b> outperformed <b>{worse}</b> by {gap * 100:.1f} points of accuracy overall."
+            )
+
+    if leaderboard:
+        ranked = sorted(
+            leaderboard.items(), key=lambda kv: kv[1].get("prompt_response_accuracy", 0.0), reverse=True,
+        )
+        tags = [tag for tag, _m in ranked]
+        primary_tags = [t for t in tags if model_label.lower() in t.lower()] or None
+        if len(ranked) > 1:
+            top_tag, top_metrics = ranked[0]
+            sentences.append(
+                f"Across all {len(ranked)} locally benchmarked models, <b>{top_tag}</b> leads the "
+                f"leaderboard at {_pct(top_metrics.get('prompt_response_accuracy'))} accuracy."
+            )
+
+    body = " ".join(sentences)
+    return [Paragraph(body, styles["body"])]
 
 
 def _letterhead(model_label: str, model_tag: str, run_info: dict[str, Any],
@@ -450,6 +561,134 @@ class _FooterCanvas(Canvas):
         self.restoreState()
 
 
+def _all_models_conclusion_paragraphs(
+    rows: list[dict[str, Any]],
+    leaderboard: Optional[dict[str, dict[str, float]]],
+    styles: dict[str, ParagraphStyle],
+) -> list[Any]:
+    """Wrap-up for the All Models report - same rule as the single-model
+    conclusion (restate figures already shown above, never a new metric),
+    scoped to the whole leaderboard instead of one model."""
+    n_models = len({str(r.get("_model_label", "")) for r in rows})
+    n_datasets = len({str(r.get("dataset", "")) for r in rows})
+    accuracy, compliance = _weighted_accuracy(rows)
+
+    sentences = [
+        f"Across <b>{n_models}</b> locally benchmarked model(s) and <b>{n_datasets}</b> "
+        f"dataset(s), overall accuracy is {_pct(accuracy)} with {_pct(compliance)} "
+        "instruction compliance."
+    ]
+
+    if leaderboard:
+        ranked = sorted(
+            leaderboard.items(), key=lambda kv: kv[1].get("prompt_response_accuracy", 0.0), reverse=True,
+        )
+        if ranked:
+            top_tag, top_metrics = ranked[0]
+            sentences.append(
+                f"<b>{top_tag}</b> leads the leaderboard at "
+                f"{_pct(top_metrics.get('prompt_response_accuracy'))} accuracy"
+                + (f", with {ranked[-1][0]} lowest at "
+                   f"{_pct(ranked[-1][1].get('prompt_response_accuracy'))}." if len(ranked) > 1 else ".")
+            )
+
+    return [Paragraph(" ".join(sentences), styles["body"])]
+
+
+def build_all_models_summary_pdf(
+    out_path: str | Path,
+    *,
+    all_rows: list[dict[str, Any]],
+    leaderboard: Optional[dict[str, dict[str, float]]] = None,
+    chart_images: Optional[Iterable[tuple[str, Any]]] = None,
+) -> None:
+    """Render the "All Models" PDF - used only when the Dashboard's model
+    filter is set to "All Models" (no single primary model selected).
+
+    Same visual language as :func:`build_model_summary_pdf` (letterhead,
+    KPI strip, results table, charts, leaderboard, conclusion), but the
+    results table carries every (model, dataset) row instead of one or two
+    models, since there's no single primary model to scope it to.
+
+    ``all_rows`` must already carry a ``_model_label`` key per row (see
+    :func:`_all_models_table` / ``_metrics_table``'s ``show_model_col``).
+    Raises on any I/O or rendering failure, same as
+    :func:`build_model_summary_pdf`.
+    """
+    out_path = Path(out_path)
+    styles = _styles()
+
+    n_models = len({str(r.get("_model_label", "")) for r in all_rows})
+
+    doc = SimpleDocTemplate(
+        str(out_path),
+        pagesize=letter,
+        leftMargin=_PAGE_MARGIN, rightMargin=_PAGE_MARGIN,
+        topMargin=0.85 * inch, bottomMargin=0.85 * inch,
+        title="PRISM summary - All Models",
+    )
+    width = doc.width
+
+    story: list[Any] = []
+
+    # ---- Letterhead -----------------------------------------------------
+    story.append(_letterhead(
+        "All Models", f"{n_models} model(s) locally available", {}, None, width, styles,
+    ))
+    story.append(Spacer(1, 14))
+
+    # ---- KPI strip --------------------------------------------------------
+    kpi = _all_models_kpi_strip(all_rows, n_models, width, styles)
+    if kpi is not None:
+        story.append(kpi)
+
+    # ---- Results by model & dataset ---------------------------------------
+    story.extend(_section("Results by Model & Dataset", styles))
+    if all_rows:
+        story.append(_all_models_table(all_rows, width))
+    else:
+        story.append(Paragraph("No dataset-level results are available locally.", styles["body"]))
+
+    # ---- Charts -----------------------------------------------------------
+    images = list(chart_images or [])
+    if images:
+        story.append(PageBreak())
+        story.extend(_section("Charts", styles))
+        for title, pixmap in images:
+            flowable = _pixmap_to_image_flowable(pixmap, max_width=width)
+            if flowable is not None:
+                story.append(KeepTogether([
+                    Paragraph(str(title), styles["body"]),
+                    Spacer(1, 4),
+                    flowable,
+                    Spacer(1, 14),
+                ]))
+
+    # ---- Leaderboard --------------------------------------------------
+    if leaderboard:
+        board_block = _section("All Models - Leaderboard", styles)
+        board_block.append(Paragraph(
+            "Average dataset-level metrics across all locally available "
+            "benchmark data for every model.",
+            styles["caption"],
+        ))
+        board_block.append(Spacer(1, 8))
+        board_block.append(_leaderboard_table(leaderboard, width))
+        story.append(KeepTogether(board_block))
+
+    # ---- Conclusion ---------------------------------------------------
+    conclusion_block = _section("Conclusion", styles)
+    conclusion_block.extend(_all_models_conclusion_paragraphs(all_rows, leaderboard, styles))
+    story.append(KeepTogether(conclusion_block))
+
+    # ---- Generation stamp -------------------------------------------------
+    story.append(Spacer(1, 16))
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    story.append(Paragraph(f"Generated {generated}", styles["caption"]))
+
+    doc.build(story, canvasmaker=_FooterCanvas)
+
+
 def build_model_summary_pdf(
     out_path: str | Path,
     *,
@@ -538,6 +777,13 @@ def build_model_summary_pdf(
         board_block.append(Spacer(1, 8))
         board_block.append(_leaderboard_table(leaderboard, width))
         story.append(KeepTogether(board_block))
+
+    # ---- Conclusion ---------------------------------------------------
+    conclusion_block = _section("Conclusion", styles)
+    conclusion_block.extend(_conclusion_paragraphs(
+        model_label, dataset_rows, compare_label, compare_rows, leaderboard, styles,
+    ))
+    story.append(KeepTogether(conclusion_block))
 
     # ---- Generation stamp -------------------------------------------------
     story.append(Spacer(1, 16))

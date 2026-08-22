@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.gui.theme import DUSK, PAPER, build_qss
-from app.gui.widgets import ModelBadge
+from app.gui.widgets import ModelBadge, FadeStackedWidget
 from app.gui.screens.startup_screen import StartupScreen
 from app.gui.screens.run_screen import RunScreen
 from app.gui.screens.dashboard_screen import DashboardScreen
@@ -60,7 +60,7 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(0)
 
         # ---------- outer switcher: home <-> startup <-> app shell ----------
-        self.outer_stack = QStackedWidget()
+        self.outer_stack = FadeStackedWidget()
         root_layout.addWidget(self.outer_stack)
 
         self.home_screen = HomeScreen()
@@ -74,7 +74,7 @@ class MainWindow(QMainWindow):
         shell_lay.setContentsMargins(0, 0, 0, 0)
         shell_lay.setSpacing(0)
 
-        self.content_stack = QStackedWidget()
+        self.content_stack = FadeStackedWidget()
         self.dashboard_screen = DashboardScreen()
         self.run_screen = RunScreen()
         self.settings_screen = SettingsScreen()
@@ -347,7 +347,7 @@ class MainWindow(QMainWindow):
         if key == "dashboard":
             self.dashboard_screen.refresh()
         action.setChecked(True)
-        self.content_stack.setCurrentWidget(widget)
+        self.content_stack.fade_to(widget)
 
     def _on_model_chosen(self, model_tag: str) -> None:
         # Same defensive re-check as _on_skip_to_dashboard - this signal is
@@ -367,7 +367,7 @@ class MainWindow(QMainWindow):
         self.model_badge.set_model(backend.model_label(model_tag))
         self.dashboard_screen.set_model(model_tag)
         self.run_screen.preselect_model(model_tag)
-        self.outer_stack.setCurrentWidget(self.app_shell)
+        self.outer_stack.fade_to(self.app_shell)
 
         # Always land on the Benchmark screen after startup - if this model
         # already has local results, preselect_model() above has already
@@ -409,7 +409,7 @@ class MainWindow(QMainWindow):
         self.model_badge.set_model(backend.model_label(model_tag))
         self.dashboard_screen.set_model(model_tag)
         self.run_screen.preselect_model(model_tag)
-        self.outer_stack.setCurrentWidget(self.app_shell)
+        self.outer_stack.fade_to(self.app_shell)
         self._show_tab("dashboard")
 
     def _on_skip_to_dashboard(self) -> None:        # Belt-and-suspenders: the skip link itself is only shown when
@@ -437,7 +437,7 @@ class MainWindow(QMainWindow):
             self.model_badge.set_model(backend.model_label(model_tag))
             self.dashboard_screen.set_model(model_tag)
             self.run_screen.preselect_model(model_tag)
-        self.outer_stack.setCurrentWidget(self.app_shell)
+        self.outer_stack.fade_to(self.app_shell)
         self._show_tab("dashboard")
 
     def _on_change_model_requested(self) -> None:
@@ -449,7 +449,7 @@ class MainWindow(QMainWindow):
         has_existing = bool(backend.models_with_data(backend.get_conn()))
         self.startup_screen.set_existing_results_available(has_existing)
         self._show_startup_chrome()
-        self.outer_stack.setCurrentWidget(self.startup_screen)
+        self.outer_stack.fade_to(self.startup_screen)
 
     def _on_home_get_started(self) -> None:
         """Home landing screen's "Get Started" - hands off to the existing
@@ -458,7 +458,7 @@ class MainWindow(QMainWindow):
         has_existing = bool(backend.models_with_data(backend.get_conn()))
         self.startup_screen.set_existing_results_available(has_existing)
         self._show_startup_chrome()
-        self.outer_stack.setCurrentWidget(self.startup_screen)
+        self.outer_stack.fade_to(self.startup_screen)
 
     def _on_run_completed(self, model_tag: str) -> None:
         # Refresh regardless of whether this was the active model (a re-run)

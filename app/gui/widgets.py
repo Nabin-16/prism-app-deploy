@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 from PySide6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QGraphicsDropShadowEffect,
-    QPushButton, QSizePolicy,
+    QGraphicsOpacityEffect, QPushButton, QSizePolicy, QStackedWidget,
 )
 from PySide6.QtGui import QColor
 
@@ -242,3 +242,85 @@ class EmptyStateCTA(QFrame):
         row.addWidget(self.button)
         row.addStretch(1)
         lay.addLayout(row)
+
+
+class FadeStackedWidget(QStackedWidget):
+    """A ``QStackedWidget`` that crossfades into the new page instead of
+    snapping to it instantly.
+
+    Plain ``QStackedWidget.setCurrentWidget`` swaps pages in a single
+    frame - correct, but it reads as an abrupt jump-cut, especially for
+    top-level navigation like "startup screen -> app shell" or
+    "Benchmark tab -> Dashboard tab" where the person just made a
+    deliberate choice and benefits from a moment of visual continuity.
+    ``fade_to`` keeps that same instant page swap (so layout/state is
+    never in a half-updated in-between state) but fades the incoming
+    page's opacity 0 -> 1 over ``duration`` ms, which is enough to read
+    as a smooth transition without feeling sluggish.
+
+    Fade state (the ``QGraphicsOpacityEffect`` and its animation) is
+    tracked per widget as an attribute on that widget, never as a single
+    shared slot on the stack itself. An earlier version kept one shared
+    "current effect/anim" pair on the stack, which broke as soon as two
+    different pages were faded in quick succession (e.g. clicking through
+    several rows fast): the second fade would overwrite the stack's
+    reference to the first fade's effect while that effect was still the
+    live target of a running/stopped ``QPropertyAnimation``, and Qt would
+    later delete that effect out from under the animation, surfacing as
+    ``RuntimeError: ... QGraphicsOpacityEffect ... already deleted``.
+    Keying the state to each widget instead means fading widget B can
+    never reach into widget A's still-in-flight animation.
+    """
+
+    def __init__(self, parent: QWidget | None = None, *, duration: int = 220) -> None:
+        super().__init__(parent)
+        self._duration = duration
+
+    def fade_to(self, widget: QWidget, *, duration: int | None = None) -> None:
+        """Switch to *widget*, fading it in. No-op if it's already current."""
+        if widget is self.currentWidget():
+            return
+
+        self.setCurrentWidget(widget)
+
+        # If *this specific widget* still has a fade in flight from an
+        # earlier transition (e.g. it was faded to and away from again
+        # quickly), stop it and drop its effect before starting a fresh
+        # one, rather than letting two animations/effects contend for the
+        # same widget.
+        prev_anim = getattr(widget, "_prism_fade_anim", None)
+        if prev_anim is not None:
+            try:
+                prev_anim.stop()
+            except RuntimeError:
+                pass  # already gone - nothing to stop
+        try:
+            widget.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+
+        anim = QPropertyAnimation(effect, b"opacity", widget)
+        anim.setDuration(duration if duration is not None else self._duration)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def _cleanup(_widget: QWidget = widget, _anim: QPropertyAnimation = anim) -> None:
+            # Only drop the effect if this animation is still the widget's
+            # current one - a newer fade may already have replaced it, and
+            # clearing its effect here would pull it out from under that
+            # newer animation instead.
+            if getattr(_widget, "_prism_fade_anim", None) is not _anim:
+                return
+            try:
+                _widget.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+
+        anim.finished.connect(_cleanup)
+        widget._prism_fade_anim = anim
+        anim.start()
