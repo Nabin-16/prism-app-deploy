@@ -30,7 +30,7 @@ from PySide6.QtCore import QThread, Signal
 from prism_core import config, ollama, seed, store
 from prism_core import benchmark as core_benchmark
 from prism_core.benchmark import BenchmarkStage
-from app.services import supabase_sync
+from app.services import supabase_sync, public_results
 
 APP_DIR = Path.home() / ".prism"
 DB_PATH = APP_DIR / "index.db"
@@ -49,6 +49,20 @@ def ensure_bundled_seed() -> list[str]:
         conn.close()
 
 
+def has_public_result(model_tag: str) -> bool:
+    """Check if a verified public result exists on GitHub for this model."""
+    return public_results.has_published_result(model_tag)
+
+
+def import_public_result(model_tag: str) -> Optional[str]:
+    """Import a verified public result into the local index."""
+    conn = get_conn()
+    try:
+        return public_results.import_public_result_into_local_store(conn, model_tag, RUNS_ROOT)
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------
 # Catalog / Ollama status
 # --------------------------------------------------------------------------
@@ -63,6 +77,31 @@ def datasets_catalog() -> dict[str, dict[str, Any]]:
 
 def ollama_available() -> bool:
     return ollama.is_available()
+
+
+def ollama_ensure_no_cloud_env() -> bool:
+    """If Ollama is already running but missing ``OLLAMA_NO_CLOUD=1``,
+    restart it under the corrected environment. Returns True if a restart
+    was performed (caller should re-poll availability before proceeding),
+    False if nothing needed to change (already correct, or undeterminable
+    on this platform - see ``ollama_installer._server_has_no_cloud_env``).
+
+    This mirrors the check ``ollama_installer.ensure_ollama`` already does
+    for the "Install/Start Ollama" button path - but that path is only
+    ever reached when the button is clicked, which never happens if
+    Ollama was *already* answering `/api/tags` at launch (e.g. started
+    manually, or left running from a previous session). Without this, a
+    plain `ollama serve` with no `OLLAMA_NO_CLOUD` set looks fully
+    "CONNECTED" to the app, and pulls then hang indefinitely on "pulling
+    manifest" on any network that can't reach Ollama's cloud endpoint -
+    exactly the symptom this setting exists to avoid.
+    """
+    from prism_core import ollama_installer
+    if ollama_installer._server_has_no_cloud_env() is False:
+        if ollama_installer._kill_stale_server_on_port():
+            ollama_installer.start()
+            return True
+    return False
 
 
 def ollama_installed_on_device() -> bool:
@@ -85,6 +124,18 @@ def installed_model_tags() -> set[str]:
     for n in names:
         expanded.add(n.split(":")[0])
     return expanded
+
+
+def installed_models() -> list[ollama.OllamaModel]:
+    """Every model Ollama currently reports installed on this device, in
+    its native (untolerated) tag form - i.e. exactly what would need its
+    own row/entry anywhere the app lists "other" models beyond the four
+    curated ones. Returns an empty list (never raises) if Ollama can't be
+    reached right now."""
+    try:
+        return ollama.list_models()
+    except ollama.OllamaError:
+        return []
 
 
 def is_installed(model_tag: str) -> bool:
@@ -335,7 +386,11 @@ class PullWorker(QThread):
             self.progress.emit(p.status, float(p.completed or 0), float(p.total or 0))
 
         try:
-            ollama.pull(self.model_tag, progress_callback=on_progress)
+            # ``cancel_event`` lets ollama.pull() notice a cancel even while
+            # the connection is stalled and no progress line has arrived to
+            # trigger on_progress() above - otherwise Stop could appear to
+            # do nothing for up to the full stall-timeout window.
+            ollama.pull(self.model_tag, progress_callback=on_progress, cancel_event=self._cancel)
             self.finished_ok.emit(True, "")
         except ollama.PullCancelled:
             self.finished_ok.emit(False, "Cancelled")
@@ -426,6 +481,17 @@ class SyncWorker(QThread):
             conn.close()
 
 
+def pending_sync_count() -> int:
+    """Number of completed local runs still sitting in the sync outbox
+    (never synced, or last attempt failed) - cheap enough to call from the
+    GUI thread on demand, e.g. to badge Settings or the status bar."""
+    conn = store.connect(DB_PATH)
+    try:
+        return supabase_sync.count_pending_runs(conn)
+    finally:
+        conn.close()
+
+
 class BenchmarkWorker(QThread):
     """Runs prism_core.benchmark.run_benchmark for one model on a worker thread."""
 
@@ -441,6 +507,7 @@ class BenchmarkWorker(QThread):
         datasets: list[str],
         max_questions: Optional[int] = None,
         overwrite: bool = False,
+        benchmark_run_id: Optional[str] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -448,6 +515,7 @@ class BenchmarkWorker(QThread):
         self.datasets = datasets
         self.max_questions = max_questions
         self.overwrite = overwrite
+        self.benchmark_run_id = benchmark_run_id
         self.cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -479,6 +547,7 @@ class BenchmarkWorker(QThread):
                 datasets=self.datasets,
                 runs_root=RUNS_ROOT,
                 conn=conn,
+                benchmark_run_id=self.benchmark_run_id,
                 max_questions=self.max_questions,
                 overwrite=self.overwrite,
                 stage_callback=on_stage,

@@ -15,6 +15,7 @@ from app.gui.screens.startup_screen import StartupScreen
 from app.gui.screens.run_screen import RunScreen
 from app.gui.screens.dashboard_screen import DashboardScreen
 from app.gui.screens.settings_screen import SettingsScreen
+from app.gui.screens.home_screen import HomeScreen
 from app.services import backend, app_state, supabase_sync
 
 RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
@@ -24,12 +25,15 @@ LOGO_WORDMARK_PATH = RESOURCES_DIR / "prism_text.png"  # mark + "PRISM" wordmark
 
 class MainWindow(QMainWindow):
     """
-    PRISM opens on a full-window startup screen (connect to Ollama, choose
-    the active model). Once a model is chosen the real app shell takes over:
-    a native menu bar + toolbar + status bar (genuine OS-style desktop chrome,
-    not a sidebar-in-a-webpage), with Dashboard / Benchmark / Settings as
-    toolbar destinations. The Dashboard and Benchmark screens are always
-    scoped to whichever single model is currently active.
+    PRISM opens on a full-window Home landing screen (mark, tagline, "Get
+    Started") with no toolbar/status bar chrome at all. "Get Started"
+    hands off to the existing full-window startup screen (connect to
+    Ollama, choose the active model). Once a model is chosen the real app
+    shell takes over: a native menu bar + toolbar + status bar (genuine
+    OS-style desktop chrome, not a sidebar-in-a-webpage), with
+    Dashboard / Benchmark / Settings as toolbar destinations. The
+    Dashboard and Benchmark screens are always scoped to whichever single
+    model is currently active.
     """
 
     def __init__(self) -> None:
@@ -55,9 +59,12 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # ---------- outer switcher: startup <-> app shell ----------
+        # ---------- outer switcher: home <-> startup <-> app shell ----------
         self.outer_stack = QStackedWidget()
         root_layout.addWidget(self.outer_stack)
+
+        self.home_screen = HomeScreen()
+        self.outer_stack.addWidget(self.home_screen)
 
         self.startup_screen = StartupScreen()
         self.outer_stack.addWidget(self.startup_screen)
@@ -83,6 +90,7 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
 
         # ---------- wiring ----------
+        self.home_screen.get_started_clicked.connect(self._on_home_get_started)
         self.startup_screen.model_chosen.connect(self._on_model_chosen)
         self.startup_screen.skip_to_dashboard.connect(self._on_skip_to_dashboard)
         self.run_screen.run_completed.connect(self._on_run_completed)
@@ -97,12 +105,30 @@ class MainWindow(QMainWindow):
         has_existing = bool(backend.models_with_data(backend.get_conn()))
         self.startup_screen.set_existing_results_available(has_existing)
         self._show_startup_chrome()
-        self.outer_stack.setCurrentWidget(self.startup_screen)
+        self.outer_stack.setCurrentWidget(self.home_screen)
 
         self._ollama_timer = QTimer(self)
         self._ollama_timer.timeout.connect(self._refresh_ollama_status)
         self._ollama_timer.start(8000)
         self._refresh_ollama_status()
+
+        # Flush any runs left in the local sync outbox from a previous
+        # offline/failed session, then keep flushing periodically - both
+        # off the GUI thread, so a slow/unreachable Supabase host never
+        # stalls the app.
+        self._sync_pending_outbox()
+        self._auto_sync_timer = QTimer(self)
+        self._auto_sync_timer.setInterval(120_000)  # 2 minutes
+        self._auto_sync_timer.timeout.connect(self._sync_pending_outbox)
+        self._auto_sync_timer.start()
+
+    def _sync_pending_outbox(self) -> None:
+        """Best-effort background flush of the local Supabase sync outbox.
+        Silently does nothing if Supabase isn't configured or nothing is
+        pending - safe to call on every launch and on a recurring timer."""
+        if not supabase_sync.is_configured():
+            return
+        supabase_sync.trigger_background_sync(lambda: backend.store.connect(backend.DB_PATH))
 
     # ---------------- chrome construction ----------------
 
@@ -188,10 +214,11 @@ class MainWindow(QMainWindow):
         model-badge/Change-button hide() applied in __init__ (before
         main.py's window.show() ever runs). Re-apply whichever chrome
         state is correct for the screen currently on top once the window
-        is actually on screen, so the startup screen never flashes them.
+        is actually on screen, so neither the Home landing screen nor the
+        startup screen ever flashes the full app-shell toolbar.
         """
         super().showEvent(event)
-        if self.outer_stack.currentWidget() is self.startup_screen:
+        if self.outer_stack.currentWidget() in (self.home_screen, self.startup_screen):
             self._show_startup_chrome()
         else:
             self._show_app_chrome()
@@ -219,9 +246,56 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if choice == QMessageBox.StandardButton.Yes:
+            # Actually stop everything in flight before letting the window
+            # close - previously "Yes" just let the window vanish while the
+            # pull/install/benchmark kept running on its QThread in the
+            # background. For a pull, that background thread (and Ollama's
+            # own in-progress download) could easily outlive the visible
+            # app, which is what made a *second* launch's pull of the same
+            # model appear to refuse to start or progress.
+            self._cancel_in_progress_work()
             super().closeEvent(event)
         else:
             event.ignore()
+
+    def _cancel_in_progress_work(self) -> None:
+        """Best-effort cancel of every worker thread still running, and a
+        short wait for each to actually finish, so nothing is left running
+        against Ollama after this window is gone."""
+        workers = []
+
+        worker = getattr(self.run_screen, "worker", None)
+        interrupted_run_id = None
+        if worker is not None and worker.isRunning():
+            # cancel() makes the engine finalize the run's DB status as
+            # "cancelled" - the right outcome for the Cancel button, but
+            # wrong here: this is the app closing mid-run, not someone
+            # deliberately abandoning it, and a "cancelled" run is never
+            # auto-resumed on the next launch. Remember its run_id so we
+            # can put it back to "running" (resumable) after it stops.
+            interrupted_run_id = getattr(self.run_screen, "_current_run_id", None)
+            worker.cancel()
+            workers.append(worker)
+
+        install_worker = getattr(self.startup_screen, "_install_worker", None)
+        if install_worker is not None and install_worker.isRunning():
+            # No cancel() on the install worker (installing/starting Ollama
+            # isn't safely interruptible mid-step) - just don't block on it.
+            pass
+
+        for tag, pull_worker in list(getattr(self.startup_screen, "pull_workers", {}).items()):
+            if pull_worker.isRunning():
+                pull_worker.cancel()
+                workers.append(pull_worker)
+
+        for w in workers:
+            w.wait(5000)  # give each up to 5s to unwind before we move on
+
+        if interrupted_run_id:
+            try:
+                backend.store.set_run_status(backend.get_conn(), interrupted_run_id, "running")
+            except Exception:
+                pass
 
     def _in_progress_reasons(self) -> list[str]:
         reasons: list[str] = []
@@ -299,9 +373,9 @@ class MainWindow(QMainWindow):
         # surfaced its own "Existing results found - View dashboard" prompt
         # there, so the user decides rather than being auto-redirected.
         self._show_tab("benchmark")
+        self._maybe_resume_interrupted_run(model_tag)
 
-    def _on_skip_to_dashboard(self) -> None:
-        # Belt-and-suspenders: the skip link itself is only shown when
+    def _on_skip_to_dashboard(self) -> None:        # Belt-and-suspenders: the skip link itself is only shown when
         # Ollama is connected (see StartupScreen._refresh_skip_link_visibility),
         # but never trust a signal alone to gate navigation - re-check here
         # too, since this is the one place that can move the user off the
@@ -340,11 +414,61 @@ class MainWindow(QMainWindow):
         self._show_startup_chrome()
         self.outer_stack.setCurrentWidget(self.startup_screen)
 
+    def _on_home_get_started(self) -> None:
+        """Home landing screen's "Get Started" - hands off to the existing
+        startup screen (connect to Ollama, choose the active model); from
+        there everything continues exactly as before."""
+        has_existing = bool(backend.models_with_data(backend.get_conn()))
+        self.startup_screen.set_existing_results_available(has_existing)
+        self._show_startup_chrome()
+        self.outer_stack.setCurrentWidget(self.startup_screen)
+
     def _on_run_completed(self, model_tag: str) -> None:
         # Refresh regardless of whether this was the active model (a re-run)
         # or a "compare" target model run from the dashboard's compare drawer.
+        # run_completed only fires from RunScreen._on_finished on a *clean*
+        # success (never on a cancelled or fatally-halted run - see
+        # RunScreen._on_finished), so jumping straight to the dashboard here
+        # never hides an error banner or a still-running benchmark - the
+        # person always lands on the freshly-refreshed results for the run
+        # that just finished, instead of having to press "View dashboard"
+        # themselves.
         self.dashboard_screen.refresh()
+        self.dashboard_screen.focus_on_latest_run(model_tag)
         self._maybe_auto_sync(model_tag)
+        self._show_tab("dashboard")
+
+    def _maybe_resume_interrupted_run(self, model_tag: str) -> None:
+        """If the app was closed (or crashed) while a benchmark run for
+        this model was mid-flight, its row in the run index was left with
+        status="running" (closeEvent's cancel just stops the worker - it
+        never marks the run finished/failed). Detect that here and resume
+        automatically rather than making the person notice and click
+        Continue themselves; the engine already reuses every completed
+        request and only re-runs what's left (see inference.run_dataset_model),
+        so this picks up where it left off instead of starting over.
+        """
+        conn = backend.get_conn()
+        row = conn.execute(
+            "SELECT benchmark_run_id, datasets FROM runs "
+            "WHERE model = ? AND status = 'running' "
+            "ORDER BY created_utc DESC LIMIT 1",
+            (model_tag,),
+        ).fetchone()
+        if row is None:
+            return
+        import json as _json
+        try:
+            datasets = _json.loads(row["datasets"]) if row["datasets"] else []
+        except Exception:
+            datasets = []
+        if not datasets:
+            return
+        self.statusBar().showMessage(
+            f"Resuming the interrupted benchmark run for {backend.model_label(model_tag)}\u2026",
+            6000,
+        )
+        self.run_screen.resume_run(model_tag, datasets, row["benchmark_run_id"])
 
     def _on_benchmark_requested(self, model_tag: str) -> None:
         if not model_tag:
@@ -366,6 +490,10 @@ class MainWindow(QMainWindow):
         that project isn't configured; failures show briefly in the status
         bar but never interrupt the app."""
         if not supabase_sync.is_configured():
+            self.statusBar().showMessage(
+                "Not synced to Supabase - PRISM_SUPABASE_URL / "
+                "PRISM_SUPABASE_PUBLISHABLE_KEY aren't set.", 6000
+            )
             return
         conn = backend.get_conn()
         info = backend.run_info(conn, model_tag)

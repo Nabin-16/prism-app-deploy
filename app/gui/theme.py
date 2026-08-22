@@ -355,6 +355,17 @@ def build_qss(p: Palette) -> str:
         background: {p.good};
         border-radius: 5px;
     }}
+    /* Ollama install + model-pull bars only - the percent text sits
+       right on top of the accent-colored fill, so it needs to be light
+       to stay readable instead of the usual dim/dark progress-bar text. */
+    QProgressBar#OllamaTaskBar {{
+        color: #ffffff;
+        border-radius: 7px;
+    }}
+    QProgressBar#OllamaTaskBar::chunk {{
+        background: {p.accent};
+        border-radius: 7px;
+    }}
 
     /* ---------- Tables ---------- */
     QTableWidget, QTableView {{
@@ -577,6 +588,33 @@ def build_qss(p: Palette) -> str:
         background: {p.accent_soft};
         border: 1.5px solid {p.accent};
     }}
+
+    /* ---------- Home / landing screen (shown on launch, before startup) ---------- */
+    #HomeRoot {{
+        background: {p.bg};
+    }}
+    QLabel#HomeTitle {{
+        font-family: {SERIF_FONT};
+        font-size: 26px;
+        font-weight: 700;
+        color: {p.text};
+        letter-spacing: 0.2px;
+    }}
+    QPushButton#HomeGetStartedBtn {{
+        background: {p.accent};
+        color: #ffffff;
+        border: 1px solid {p.accent};
+        border-radius: {R_MD};
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+        padding: 11px 26px;
+    }}
+    QPushButton#HomeGetStartedBtn:hover {{
+        background: {p.accent_text};
+        border-color: {p.accent_text};
+    }}
+    QPushButton#HomeGetStartedBtn:pressed {{ background: {p.accent}; }}
 
     /* ---------- Native desktop chrome: toolbar / status bar (menu bar removed) ---------- */
     QToolBar#AppToolBar {{

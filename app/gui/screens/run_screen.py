@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 from app.gui.widgets import card, h2, body, faint, divider, SectionHeader, MetricTile, kicker, centered_column
 from app.services import backend
 from app.services.backend import BenchmarkWorker
+from prism_core import fingerprint
 
 
 def _format_eta(seconds: float) -> str:
@@ -29,6 +30,7 @@ class RunScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker: BenchmarkWorker | None = None
+        self._current_run_id: str | None = None
         self.model_tag: str | None = None
         self._success_count = 0
         self._error_count = 0
@@ -60,8 +62,7 @@ class RunScreen(QWidget):
         self.title_lbl.setWordWrap(True)
         header_col.addWidget(self.title_lbl)
         self.sub_lbl = body(
-            "Runs the full PRISM pipeline for this model: inference \u2192 parsing \u2192 "
-            "consistency scoring \u2192 summary - against your local Ollama installation."
+            "Runs the full PRISM pipeline for this model."
         )
         header_col.addWidget(self.sub_lbl)
         header_row.addLayout(header_col, 1)
@@ -119,7 +120,6 @@ class RunScreen(QWidget):
         opts_lay.setContentsMargins(22, 18, 22, 20)
         opts_lay.setSpacing(10)
         opts_lay.addWidget(h2("Options"))
-        opts_lay.addWidget(faint("Sampling limits and re-run behaviour."))
         limit_row = QHBoxLayout()
         limit_row.addWidget(faint("Max questions"))
         self.max_q_spin = QSpinBox()
@@ -225,7 +225,18 @@ class RunScreen(QWidget):
         # so nothing renders it. self.log itself is left fully intact and
         # keeps receiving every appendPlainText()/clear() call below exactly
         # as before - only its visibility changed, not its behavior.
-        log_card = card("Card")
+        #
+        # IMPORTANT: log_card has no C++ parent (it's deliberately not
+        # added to any layout) and previously wasn't stored anywhere in
+        # Python either - once __init__ returned, nothing referenced it,
+        # so it (and everything it owns, including self.log) got garbage
+        # collected almost immediately. Any later signal handler that
+        # touched self.log - e.g. _on_fatal_halt firing because Ollama's
+        # connection dropped - then crashed with a shiboken "Internal C++
+        # object already deleted" RuntimeError. Keeping a reference on
+        # self is what keeps it (and self.log) alive for the screen's
+        # actual lifetime.
+        self._log_card = log_card = card("Card")
         ll = QVBoxLayout(log_card)
         ll.setContentsMargins(22, 18, 22, 18)
         ll.setSpacing(8)
@@ -307,20 +318,35 @@ class RunScreen(QWidget):
         self.continue_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.continue_btn.setFixedHeight(40)
         self.continue_btn.setVisible(False)
-        self.continue_btn.clicked.connect(self.continue_requested.emit)
+        self.continue_btn.clicked.connect(self._on_view_dashboard_clicked)
         continue_row.addWidget(self.continue_btn)
         root.addLayout(continue_row)
+
+    def _on_view_dashboard_clicked(self) -> None:
+        if self.model_tag and not backend.has_data(backend.get_conn(), self.model_tag):
+            if backend.has_public_result(self.model_tag):
+                backend.import_public_result(self.model_tag)
+        self.continue_requested.emit()
 
     def preselect_model(self, model_tag: str) -> None:
         self.model_tag = model_tag
         self.title_lbl.setText(f"Run benchmark - {backend.model_label(model_tag)}")
         self.continue_btn.setVisible(False)
+        self.continue_btn.setText("View dashboard  \u2192")
         if backend.has_data(backend.get_conn(), model_tag):
             self.status_title.setText("Existing results found")
             self.status_sub.setText(
-                "This model already has local benchmark data - continue to the "
+                "This model already has benchmark data on this device - continue to the "
                 "dashboard, or start a fresh run above."
             )
+            self.continue_btn.setVisible(True)
+        elif backend.has_public_result(model_tag):
+            self.status_title.setText("Verified public results available")
+            self.status_sub.setText(
+                "A verified PRISM benchmark result from GitHub is available for this model - "
+                "view the verified results on the dashboard, or run a fresh benchmark locally."
+            )
+            self.continue_btn.setText("View verified result  \u2192")
             self.continue_btn.setVisible(True)
         else:
             self.status_title.setText("Idle")
@@ -332,6 +358,29 @@ class RunScreen(QWidget):
         if not self.model_tag:
             self.status_title.setText("No model selected")
             self.status_sub.setText("Pick a model on the startup screen first.")
+            return
+
+        if not backend.ollama_available():
+            # is_installed() below silently returns False whenever Ollama
+            # can't be reached at all (it swallows OllamaError), which used
+            # to surface as the misleading "Model not installed" message
+            # even when the model *was* pulled and the real problem was
+            # that the Ollama server had stopped/crashed. Check reachability
+            # first so the error the user sees matches the real cause.
+            QMessageBox.critical(
+                self,
+                "Ollama isn't running",
+                (
+                    "Can't reach Ollama at all right now, so inference can't "
+                    "run even though the model may already be pulled.\n\n"
+                    "Make sure the Ollama server is running, then try Start "
+                    "again."
+                ),
+            )
+            self.status_title.setText("Ollama not reachable")
+            self.status_sub.setText(
+                "Start (or restart) the Ollama server, then press Start again."
+            )
             return
 
         if not backend.is_installed(self.model_tag):
@@ -385,10 +434,12 @@ class RunScreen(QWidget):
         self.error_banner.setVisible(False)
         self._last_datasets = datasets
         self._last_max_q = max_q
+        self._current_run_id = fingerprint.new_benchmark_run_id()
 
         self.worker = BenchmarkWorker(
             self.model_tag, datasets,
             max_questions=max_q, overwrite=self.overwrite_cb.isChecked(),
+            benchmark_run_id=self._current_run_id,
         )
         self.worker.stage.connect(self._on_stage)
         self.worker.request_progress.connect(self._on_progress)
@@ -396,7 +447,19 @@ class RunScreen(QWidget):
         self.worker.fatal_halt.connect(self._on_fatal_halt)
         self.worker.start()
 
-    def cancel_run(self) -> None:
+    def resume_run(self, model_tag: str, datasets: list[str], benchmark_run_id: str) -> None:
+        """Entry point for resuming a run that was left ``status="running"``
+        in the run index from a previous app session (see MainWindow._maybe_
+        resume_interrupted_run). Reuses the same benchmark_run_id so the
+        engine finds and reuses the interrupted run's existing raw records
+        instead of starting a new run directory from scratch."""
+        self.model_tag = model_tag
+        self._last_datasets = datasets
+        self._last_max_q = None
+        self._current_run_id = benchmark_run_id
+        self._restart(overwrite=False)
+
+    def cancel_run(self) -> None:        
         if self.worker:
             self.worker.cancel()
             self.status_sub.setText("Cancelling after the current request\u2026")
@@ -415,6 +478,17 @@ class RunScreen(QWidget):
         self.log.appendPlainText(f"\u26a0 HALTED: {reason}")
 
     def _restart(self, *, overwrite: bool) -> None:
+        if not backend.ollama_available():
+            # A fatal halt is often caused by exactly this (lost connection
+            # to Ollama) - re-check before blindly retrying so the person
+            # gets a clear message instead of watching it halt again.
+            QMessageBox.critical(
+                self,
+                "Ollama isn't running",
+                "Still can't reach Ollama. Start (or restart) the server, "
+                "then try again.",
+            )
+            return
         self.error_banner.setVisible(False)
         datasets = getattr(self, "_last_datasets", None) or [
             n for n, cb in self.dataset_checks.items() if cb.isChecked()
@@ -427,6 +501,7 @@ class RunScreen(QWidget):
         self.worker = BenchmarkWorker(
             self.model_tag, datasets,
             max_questions=max_q, overwrite=overwrite,
+            benchmark_run_id=self._current_run_id,
         )
         self.worker.stage.connect(self._on_stage)
         self.worker.request_progress.connect(self._on_progress)
@@ -498,8 +573,19 @@ class RunScreen(QWidget):
                 f"{overall_pct}%  \u00b7  dataset {min(index + 1, count)} of {count}"
             )
 
+        # Tally running success/error counts. "reused" (a previously
+        # completed request loaded from cache rather than re-run) counts as
+        # successful for display purposes; only "error" increments the
+        # error tile. These counters were being reset to 0 before every run
+        # but never actually incremented here, so the tiles sat frozen at
+        # "0" for the whole run regardless of real progress.
         if status == "error":
+            self._error_count = getattr(self, "_error_count", 0) + 1
+            self.stat_errors.set_value(str(self._error_count))
             self.log.appendPlainText(f"  \u2715 error on {dataset} request {request_number}")
+        elif status in ("success", "reused"):
+            self._success_count = getattr(self, "_success_count", 0) + 1
+            self.stat_success.set_value(str(self._success_count))
 
     def _on_finished(self, success: bool, message: str, result) -> None:
         self.cancel_btn.setEnabled(False)

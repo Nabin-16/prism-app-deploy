@@ -10,9 +10,10 @@ viewed side by side without leaving the screen.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from typing import Any, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QStandardPaths, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -197,6 +198,10 @@ class DashboardScreen(QWidget):
         self._compare_combo.setMinimumWidth(160)
         self._compare_combo.currentIndexChanged.connect(self._on_filter_changed)
         filter_layout.addWidget(self._compare_combo)
+        # Kept in sync by _refresh_compare_options(): rebuilt any time the
+        # primary "Model:" selection changes, since which models are valid
+        # to compare against depends on it (see that method for why).
+        self._model_combo.currentIndexChanged.connect(self._refresh_compare_options)
 
         filter_layout.addWidget(QLabel("Dataset:"))
         self._dataset_combo = QComboBox()
@@ -337,6 +342,7 @@ class DashboardScreen(QWidget):
 
         models = sorted({r.get("model", "") for r in self._ds_rows if r.get("model")})
         datasets = sorted({r.get("dataset", "") for r in self._ds_rows if r.get("dataset")})
+        self._all_models_cache = models
 
         for combo in (self._model_combo, self._compare_combo, self._dataset_combo):
             combo.blockSignals(True)
@@ -346,11 +352,6 @@ class DashboardScreen(QWidget):
         for m in models:
             self._model_combo.addItem(m)
 
-        self._compare_combo.clear()
-        self._compare_combo.addItem("None")
-        for m in models:
-            self._compare_combo.addItem(m)
-
         self._dataset_combo.clear()
         self._dataset_combo.addItem("All Datasets")
         for d in datasets:
@@ -359,15 +360,47 @@ class DashboardScreen(QWidget):
         idx = self._model_combo.findText(cur_model)
         if idx >= 0:
             self._model_combo.setCurrentIndex(idx)
-        idx = self._compare_combo.findText(cur_compare)
-        if idx >= 0:
-            self._compare_combo.setCurrentIndex(idx)
         idx = self._dataset_combo.findText(cur_ds)
         if idx >= 0:
             self._dataset_combo.setCurrentIndex(idx)
 
-        for combo in (self._model_combo, self._compare_combo, self._dataset_combo):
+        for combo in (self._model_combo, self._dataset_combo):
             combo.blockSignals(False)
+
+        # Compare combo depends on the (now possibly-restored) primary
+        # model selection, so build it after restoring cur_model above.
+        self._refresh_compare_options(preferred=cur_compare)
+
+    def _refresh_compare_options(self, *_args, preferred: Optional[str] = None) -> None:
+        """Rebuild the "Compare with" list so it can never offer a
+        self-comparison, and disable it entirely when the primary "Model:"
+        selector is "All Models" - comparing "all models" against one
+        specific model isn't a coherent view, so the option shouldn't be
+        there to pick in the first place."""
+        primary = self._model_combo.currentText()
+        preferred = self._compare_combo.currentText() if preferred is None else preferred
+
+        self._compare_combo.blockSignals(True)
+        self._compare_combo.clear()
+        self._compare_combo.addItem("None")
+
+        if primary == "All Models":
+            self._compare_combo.setEnabled(False)
+            self._compare_combo.setToolTip(
+                "Pick a specific model above to compare it against another."
+            )
+        else:
+            self._compare_combo.setEnabled(True)
+            self._compare_combo.setToolTip("")
+            models = getattr(self, "_all_models_cache", [])
+            for m in models:
+                if m != primary:  # never offer comparing a model to itself
+                    self._compare_combo.addItem(m)
+
+        idx = self._compare_combo.findText(preferred)
+        self._compare_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._compare_combo.blockSignals(False)
+        self._on_filter_changed()
 
     def _on_filter_changed(self) -> None:
         self._update_views()
@@ -713,8 +746,22 @@ class DashboardScreen(QWidget):
         )
 
         default_name = f"PRISM_{primary.replace(':', '_').replace('/', '_')}_summary.pdf"
+
+        # QFileDialog's "dir" argument needs an actual directory, not a bare
+        # filename - passing just ``default_name`` leaves Qt to fall back to
+        # the process's current working directory, which for an installed
+        # desktop app is the app's own folder rather than anywhere the user
+        # would expect a downloaded file to land. Anchor it to the user's
+        # Documents folder (falling back to their home directory) so the
+        # dialog always opens somewhere on the user's own filesystem, and
+        # the PDF is written straight there - never into the app's install
+        # directory - regardless of what the user picks.
+        docs_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        default_dir = Path(docs_dir) if docs_dir else Path.home()
+        default_path = default_dir / default_name
+
         out_path, _ = QFileDialog.getSaveFileName(
-            self, "Download PDF summary", default_name, "PDF files (*.pdf)",
+            self, "Download PDF summary", str(default_path), "PDF files (*.pdf)",
         )
         if not out_path:
             return
@@ -755,6 +802,33 @@ class DashboardScreen(QWidget):
         idx = self._model_combo.findText(model_tag)
         if idx >= 0:
             self._model_combo.setCurrentIndex(idx)
+
+    def focus_on_latest_run(self, model_tag: str) -> None:
+        """Called by MainWindow right after a benchmark run finishes so the
+        person lands on *just* that run's data, not whatever filters were
+        left over from a previous dashboard visit. Scopes the view to this
+        model alone (no lingering "Compare with" selection - possibly for a
+        model that no longer has any run at all) and to "User Runs" only,
+        so a freshly completed run isn't diluted by bundled Research
+        Results baseline rows for the same model/dataset. Call reload_data()/
+        refresh() afterwards so the filter combos have this run's data to
+        select from before this is applied.
+        """
+        idx = self._model_combo.findText(model_tag)
+        if idx >= 0:
+            self._model_combo.blockSignals(True)
+            self._model_combo.setCurrentIndex(idx)
+            self._model_combo.blockSignals(False)
+
+        idx = self._source_combo.findText("User Runs")
+        if idx >= 0:
+            self._source_combo.blockSignals(True)
+            self._source_combo.setCurrentIndex(idx)
+            self._source_combo.blockSignals(False)
+
+        # Rebuilds "Compare with" for the new primary model and resets it
+        # to "None" (also triggers the one view update this method needs).
+        self._refresh_compare_options(preferred="None")
 
     # Aliases matching the method names MainWindow calls.
     def refresh(self) -> None:

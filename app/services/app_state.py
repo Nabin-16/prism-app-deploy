@@ -15,6 +15,8 @@ STATE_PATH = APP_DIR / "app_state.json"
 _DEFAULTS: dict[str, Any] = {
     "selected_model": None,
     "theme": "paper",
+    "pending_install": False,
+    "pending_pull_tags": [],
 }
 
 
@@ -53,3 +55,39 @@ def set_theme(theme: str) -> None:
     state = _read()
     state["theme"] = theme
     _write(state)
+
+
+# --- resume-on-relaunch markers ---------------------------------------------
+# Set the moment an install/pull actually starts, cleared only on a
+# *successful* finish - so if the app is closed (or crashes) mid-task, the
+# marker survives and the next launch knows to pick it back up
+# automatically instead of silently forgetting an interrupted setup step.
+
+def set_pending_install(pending: bool) -> None:
+    state = _read()
+    state["pending_install"] = pending
+    _write(state)
+
+
+def get_pending_install() -> bool:
+    return bool(_read().get("pending_install", False))
+
+
+def add_pending_pull(model_tag: str) -> None:
+    state = _read()
+    tags = set(state.get("pending_pull_tags") or [])
+    tags.add(model_tag)
+    state["pending_pull_tags"] = sorted(tags)
+    _write(state)
+
+
+def remove_pending_pull(model_tag: str) -> None:
+    state = _read()
+    tags = set(state.get("pending_pull_tags") or [])
+    tags.discard(model_tag)
+    state["pending_pull_tags"] = sorted(tags)
+    _write(state)
+
+
+def get_pending_pull_tags() -> list[str]:
+    return list(_read().get("pending_pull_tags") or [])

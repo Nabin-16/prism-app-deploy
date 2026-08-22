@@ -26,11 +26,56 @@ import os
 from typing import Optional
 
 try:  # optional dependency - only needed to read a local .env in dev/packaging
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv, find_dotenv
 
-    load_dotenv()
+    _DOTENV_AVAILABLE = True
+
+    # Plain load_dotenv() with no path only finds a `.env` file that happens
+    # to sit at-or-above the process's *current working directory* - it has
+    # no idea where this project actually lives. That works fine when you
+    # launch the app from the project root in a terminal, but silently finds
+    # nothing (no error - env vars just stay unset) launched any other way:
+    # a desktop shortcut, a different cwd, `python -m` from elsewhere, a
+    # packaged build. Supabase sync then quietly no-ops with no indication
+    # why. Anchor the search at this file's own location and walk upward,
+    # so it finds the project's `.env` regardless of the working directory
+    # the app was launched from.
+    _env_path = find_dotenv(filename=".env", usecwd=False)
+    if not _env_path:
+        # find_dotenv()'s own upward search starts from the caller's frame,
+        # which can behave unexpectedly in a packaged/frozen build - fall
+        # back to walking up from this file's own directory explicitly.
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _candidate = _here
+        for _ in range(6):  # project root is a few levels up at most
+            _maybe = os.path.join(_candidate, ".env")
+            if os.path.isfile(_maybe):
+                _env_path = _maybe
+                break
+            _parent = os.path.dirname(_candidate)
+            if _parent == _candidate:
+                break
+            _candidate = _parent
+    if _env_path:
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()  # last resort: cwd-based default behavior
+
 except ImportError:
-    pass
+    # This used to be a silent no-op - if `python-dotenv` simply isn't
+    # installed in whatever Python environment is running the app (a very
+    # easy state to end up in: a venv the dependency was never installed
+    # into, a system Python separate from the one `pip install`s went to,
+    # etc.), a `.env` file could sit right there, fully correct, and never
+    # be read - with zero indication why Supabase sync (or anything else
+    # reading env vars) just quietly never turns on. DOTENV_AVAILABLE lets
+    # callers (e.g. the Settings screen's Cloud Sync panel) surface a
+    # concrete "python-dotenv isn't installed" message instead of the
+    # generic "not configured" one, which sends someone chasing the wrong
+    # problem (their .env contents) instead of the real one (pip install).
+    _DOTENV_AVAILABLE = False
+
+DOTENV_AVAILABLE: bool = _DOTENV_AVAILABLE
 
 # --- Reproducibility / sampling -------------------------------------------
 RANDOM_SEED: int = 2026

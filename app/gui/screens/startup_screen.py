@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.gui.widgets import pill, card, h2, body, faint, SectionHeader, centered_column
-from app.services import backend, app_state, supabase_sync
+from app.services import backend, app_state, supabase_sync, public_results
 from app.services.backend import PullWorker
 
 
@@ -52,6 +52,11 @@ class ModelRow(QFrame):
         top.addLayout(text_col, 1)
         top.addStretch(0)
 
+        self.public_pill = pill("VERIFIED", "#38bdf8", "rgba(56, 189, 248, 0.12)")
+        self.public_pill.setToolTip("Verified public benchmark results are published on GitHub.")
+        self.public_pill.setVisible(public_results.has_published_result(model_tag))
+        top.addWidget(self.public_pill, 0, Qt.AlignmentFlag.AlignVCenter)
+
         self.status_pill = pill("CHECKING\u2026", "#9c99a8", "transparent")
         top.addWidget(self.status_pill, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -72,6 +77,7 @@ class ModelRow(QFrame):
         root.addLayout(top)
 
         self.progress = QProgressBar()
+        self.progress.setObjectName("OllamaTaskBar")
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setVisible(False)
@@ -227,6 +233,7 @@ class StartupScreen(QWidget):
         # a busy/indeterminate bar for steps like "running the installer"
         # or "starting the service" where there's no percentage to show).
         self.install_progress = QProgressBar()
+        self.install_progress.setObjectName("OllamaTaskBar")
         self.install_progress.setRange(0, 100)
         self.install_progress.setValue(0)
         self.install_progress.setFixedHeight(16)
@@ -357,13 +364,40 @@ class StartupScreen(QWidget):
 
         reachable = backend.ollama_available()
         if reachable:
+            # Ollama answering /api/tags only means *something* is up on
+            # the port - if it's a plain `ollama serve` missing
+            # OLLAMA_NO_CLOUD=1 (started manually, or left running from a
+            # previous session), pulls will hang forever on "pulling
+            # manifest" on networks that can't reach Ollama's cloud
+            # endpoint. The button-driven install/start path already
+            # detects and fixes this, but that path never runs when
+            # Ollama was already reachable at launch - check and restart
+            # here too so "CONNECTED" always actually means pulls will
+            # work. Best-effort/self-healing: if a restart happens, give
+            # the freshly-restarted server a moment to come back up
+            # before trusting reachable/CONNECTED below.
+            if backend.ollama_ensure_no_cloud_env():
+                reachable = backend.ollama_available()
+        if reachable:
             self._connected = True
             self.status_dot.setObjectName("StatusDotGood")
             self._refresh_dot_style()
             self.status_pill.setText("CONNECTED")
             self.status_pill.setStyleSheet("background: rgba(95,209,142,0.15); color:#5fd18e;")
+            # The install button is only ever driven by the "not reachable"
+            # branch below (Install Ollama / Start Ollama / Working...). If
+            # an install/start was ever kicked off and Ollama then came up
+            # (including just because the user started it themselves and
+            # hit Refresh), nothing was resetting this button - it would
+            # stay stuck on "Working..." forever even though everything is
+            # now fine. Hide it once we're actually connected.
+            if self._install_worker is None:
+                self.install_btn.setEnabled(True)
+                self.install_btn.setVisible(False)
+                self.install_progress.setVisible(False)
             self._refresh_skip_link_visibility()
             self._show_model_picker()
+            self._resume_pending_work()
         else:
             self._connected = False
             self._refresh_skip_link_visibility()
@@ -373,21 +407,50 @@ class StartupScreen(QWidget):
             self.status_pill.setStyleSheet("background: rgba(234,107,107,0.15); color:#ea6b6b;")
 
             already_installed = backend.ollama_installed_on_device()
+            for tag, row in self.model_rows.items():
+                if tag not in self.pull_workers:
+                    row.action_btn.setEnabled(False)
             if already_installed:
                 self.status_detail.setText(
                     "Ollama is installed on this device but isn't running. "
-                    "Click Install Ollama to start it, or refresh status if "
-                    "you've started it yourself."
+                    "Click Start Ollama, or refresh status if you've "
+                    "started it yourself."
                 )
                 self.install_btn.setText("Start Ollama")
                 self.install_btn.setVisible(True)
+                # The binary is present, so whatever earlier install
+                # attempt was pending is effectively resolved - starting
+                # it from here is a plain "Start", not a fresh install,
+                # so don't leave a stale pending_install flag around to
+                # cause a confusing "previous install didn't finish"
+                # message on some future launch.
+                app_state.set_pending_install(False)
             elif backend.ollama_auto_install_supported():
-                self.status_detail.setText(
-                    "Ollama isn't installed on this device. PRISM can install "
-                    "the latest stable release automatically."
-                )
+                if app_state.get_pending_install():
+                    # A previous install was actually kicked off (by a
+                    # click) and never finished - the app was closed or
+                    # crashed mid-install. Say so, but still require a
+                    # fresh click rather than auto-firing.
+                    self.status_detail.setText(
+                        "A previous Ollama install didn't finish (the app "
+                        "was closed or crashed partway through). Click "
+                        "Install Ollama to try again."
+                    )
+                else:
+                    self.status_detail.setText(
+                        "Ollama isn't installed on this device. PRISM can "
+                        "install the latest stable release automatically."
+                    )
                 self.install_btn.setText("Install Ollama")
                 self.install_btn.setVisible(True)
+                # Deliberately NOT auto-clicking Install here even if
+                # pending_install is set - the very first install must
+                # always be a person's explicit click, never something
+                # that fires the moment the app opens. pending_install is
+                # still used (see below) to distinguish "never tried" from
+                # "an install was actually in flight and got cut off", and
+                # to show a clear one-line explanation in that second case
+                # instead of silently starting.
             else:
                 self.status_detail.setText(
                     "Ollama isn't reachable at localhost:11434, and this "
@@ -396,11 +459,18 @@ class StartupScreen(QWidget):
                     "refresh status."
                 )
                 self.install_btn.setVisible(False)
+            # Whether or not Ollama itself is reachable, the model rows
+            # should never be left showing their initial "CHECKING..."
+            # placeholder forever - reflect what's actually on disk (or
+            # "NOT INSTALLED" if nothing is, since nothing can be pulled
+            # without a running server anyway).
+            self._refresh_model_rows()
             self._update_continue_btn()
 
     def _on_install_clicked(self) -> None:
         if self._install_worker is not None:
             return
+        app_state.set_pending_install(True)
         self.install_btn.setEnabled(False)
         self.install_btn.setText("Working\u2026")
         self.refresh_btn.setEnabled(False)
@@ -448,15 +518,33 @@ class StartupScreen(QWidget):
         self.refresh_btn.setEnabled(True)
         self.install_progress.setVisible(False)
         if ok:
+            app_state.set_pending_install(False)
             self._check_ollama()
             return
         # Window exception dialog: never leave the user staring at a stuck
         # status line - surface exactly what went wrong and how to recover.
-        QMessageBox.critical(
-            self,
-            "Couldn't set up Ollama",
-            error_message or "An unknown error occurred while setting up Ollama.",
-        )
+        # The install script can fail on a *later* step (e.g. enabling the
+        # systemd service) after the ollama binary is already in place -
+        # check for that rather than always telling the person to go
+        # install it manually when a plain "Start Ollama" click would
+        # actually work fine from here.
+        from prism_core import ollama_installer
+        if ollama_installer.find_binary() is not None:
+            QMessageBox.warning(
+                self,
+                "Ollama installed, but setup didn't fully finish",
+                (
+                    (error_message or "The install script reported an error.")
+                    + "\n\nThe Ollama program itself was installed successfully "
+                    "though - click \u201cStart Ollama\u201d below to finish up."
+                ),
+            )
+        else:
+            QMessageBox.critical(
+                self,
+                "Couldn't set up Ollama",
+                error_message or "An unknown error occurred while setting up Ollama.",
+            )
         self._check_ollama()
 
     def _refresh_dot_style(self) -> None:
@@ -470,6 +558,7 @@ class StartupScreen(QWidget):
 
     def _show_model_picker(self) -> None:
         self._load_cloud_models()
+        self._load_locally_installed_models()
         self._refresh_model_rows()
 
         remembered = app_state.get_selected_model()
@@ -583,6 +672,15 @@ class StartupScreen(QWidget):
     def _refresh_model_rows(self) -> None:
         installed = backend.installed_model_tags()
         for tag, row in self.model_rows.items():
+            if tag in self.pull_workers:
+                # A pull is actively running for this row - set_installed()
+                # unconditionally resets the action button/pill (that's
+                # what "not installed yet" and "already installed" both
+                # need), which would revert an in-progress pull back to a
+                # plain "Pull model" button while the progress bar
+                # underneath kept showing stale progress. Leave pulling
+                # rows alone; _pull_finished() refreshes them once done.
+                continue
             row.set_installed(tag in installed or tag.split(":")[0] in installed)
         if self.selected_model_tag:
             self._update_ram_warning(self.selected_model_tag)
@@ -590,15 +688,22 @@ class StartupScreen(QWidget):
 
 
     def _load_cloud_models(self) -> None:
-        """Pull in any "other model" tags previously saved to Supabase
-        (from this device or another one) and add a row for each that isn't
-        already part of the built-in catalog, so they show up on every
-        launch instead of only for the session that added them."""
+        """Add a row for any "other model" tag previously saved to
+        Supabase (from this device or another one) that is *also* actually
+        installed on this device. Only the four curated catalog models are
+        shown regardless of install state (so they can be pulled); any
+        "other model" tag - which exists purely so a pull can be resumed/
+        retried across launches - has no reason to keep occupying a row
+        once its pull was abandoned or never finished, since there's
+        nothing useful to do with it here except pull it again (which
+        "Add other models" already covers)."""
         if not supabase_sync.is_configured():
             return
         for entry in supabase_sync.fetch_custom_models():
             tag = (entry.get("model_tag") or "").strip()
             if not tag or tag in self.model_rows:
+                continue
+            if not backend.is_installed(tag):
                 continue
             label = entry.get("label") or tag
             row = ModelRow(tag, label)
@@ -607,7 +712,63 @@ class StartupScreen(QWidget):
             row.selected.connect(self._select_model)
             self.model_rows[tag] = row
             self.rows_lay.addWidget(row)
-            row.set_installed(backend.is_installed(tag))
+            row.set_installed(True)
+
+    def _load_locally_installed_models(self) -> None:
+        """Add a row for every model Ollama already has installed on this
+        device that isn't one of the four curated models and isn't already
+        shown (e.g. from Supabase above). This is what makes "other" models
+        show up here at all - and survive a restart - without depending on
+        Supabase being configured: Ollama itself is the persistence layer
+        (a pulled model stays on disk and in ``ollama list`` regardless of
+        this app), so simply asking it what's installed, every time this
+        screen is shown, is enough. Previously only the four built-in
+        models plus whatever had separately been saved to Supabase's
+        ``custom_models`` table ever got a row - a model pulled directly via
+        ``ollama pull`` in a terminal, or through this app while Supabase
+        wasn't configured, was fully installed and usable but invisible
+        here on the very next launch.
+        """
+        for model in backend.installed_models():
+            tag = model.name
+            if not tag or tag in self.model_rows:
+                continue
+            row = ModelRow(tag, backend.model_label(tag))
+            row.pull_requested.connect(self._start_pull)
+            row.stop_requested.connect(self._stop_pull)
+            row.selected.connect(self._select_model)
+            self.model_rows[tag] = row
+            self.rows_lay.addWidget(row)
+            row.set_installed(True)
+
+    def _resume_pending_work(self) -> None:
+        """Called once Ollama is confirmed connected. Any model pull that
+        was left marked pending (started, never finished successfully -
+        e.g. the app was closed or crashed mid-download) gets restarted
+        automatically here. Ollama itself resumes the actual byte range
+        from wherever the partial blob on disk left off, so this doesn't
+        redownload from zero.
+
+        A pending marker can also outlive a pull that actually *succeeded*
+        - e.g. the app was closed in the gap between the download finishing
+        and ``_pull_finished`` running, or the process was killed right as
+        the marker would have been cleared. Blindly restarting the pull in
+        that case redoes the whole "pulling manifest" handshake against a
+        model Ollama already has fully installed. Check installed-state
+        first and just clear the stale marker instead of re-pulling."""
+        for tag in app_state.get_pending_pull_tags():
+            if tag in self.pull_workers:
+                continue
+            if backend.is_installed(tag):
+                app_state.remove_pending_pull(tag)
+                continue
+            if tag in self.model_rows:
+                self._start_pull(tag)
+            else:
+                # A custom/cloud tag not currently rendered as a row -
+                # nothing to attach progress to, so just drop the marker
+                # rather than pulling silently with no UI.
+                app_state.remove_pending_pull(tag)
 
     def _pull_custom_model(self) -> None:
         tag = self.custom_model_input.text().strip()
@@ -637,9 +798,22 @@ class StartupScreen(QWidget):
         row = self.model_rows.get(model_tag)
         if row is None:
             return
+        if not backend.ollama_available():
+            # Pull buttons are created up front for every catalog model
+            # regardless of whether Ollama is actually installed/running,
+            # so nothing previously stopped a click here from firing a
+            # doomed /api/pull request at a server that isn't there.
+            QMessageBox.critical(
+                self,
+                "Ollama isn't running",
+                "Ollama needs to be installed and running before a model "
+                "can be pulled. Install/start it above, then try again.",
+            )
+            return
         if not backend.is_installed(model_tag) and not self._confirm_ram_ok(model_tag):
             return
         row.set_pulling(True)
+        app_state.add_pending_pull(model_tag)
 
         worker = PullWorker(model_tag)
         worker.progress.connect(row.update_progress)
@@ -656,6 +830,14 @@ class StartupScreen(QWidget):
             row.stop_btn.setEnabled(False)
             row.progress_label.setVisible(True)
             row.progress_label.setText("Stopping\u2026")
+        # A user-requested Stop is a deliberate "not now", not an
+        # interruption - drop the pending-pull marker right away so this
+        # doesn't look identical to an app-closed-mid-download and get
+        # silently auto-resumed the next time PRISM launches. (An actual
+        # crash/close mid-pull never reaches this method at all, so it
+        # still leaves the marker in place and still resumes, same as
+        # before.)
+        app_state.remove_pending_pull(model_tag)
         worker.cancel()
         if self._auto_continue_tag == model_tag:
             self._auto_continue_tag = None
@@ -664,6 +846,13 @@ class StartupScreen(QWidget):
         row = self.model_rows.get(model_tag)
         self.pull_workers.pop(model_tag, None)
         cancelled = msg == "Cancelled"
+        if ok or cancelled:
+            # Success clears the marker because the pull is done. A user
+            # cancel already cleared it in _stop_pull, but remove it here
+            # too (idempotent) in case _pull_finished is ever reached via
+            # some other path that sets msg == "Cancelled" without going
+            # through _stop_pull first.
+            app_state.remove_pending_pull(model_tag)
         if row is not None:
             row.set_pulling(False)
             if not ok and msg:

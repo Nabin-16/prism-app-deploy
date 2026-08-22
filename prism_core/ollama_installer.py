@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -119,7 +120,13 @@ def find_binary() -> Optional[str]:
             Path("/Applications/Ollama.app/Contents/Resources/ollama"),
         ]
     elif system == "Linux":
-        candidates += [Path("/usr/local/bin/ollama"), Path("/usr/bin/ollama")]
+        candidates += [
+            Path("/usr/local/bin/ollama"),
+            Path("/usr/bin/ollama"),
+            Path("/snap/bin/ollama"),
+            Path.home() / ".local" / "bin" / "ollama",
+            Path.home() / "bin" / "ollama",
+        ]
     elif system == "Windows":
         local = Path.home() / "AppData" / "Local" / "Programs" / "Ollama"
         candidates += [local / "ollama.exe"]
@@ -269,6 +276,87 @@ def _fetch_install_script() -> str:
     )
 
 
+_PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+
+
+def _run_install_script_streaming(
+    script: str, env: Optional[dict], cb: ProgressCB
+) -> tuple[int, str]:
+    """Run the official install.sh with live progress instead of blocking
+    silently for minutes. Previously this used ``subprocess.run(...,
+    capture_output=True)``, which sends exactly one progress update before
+    the install script starts and then nothing else until it finishes (up
+    to 15 minutes later) - the UI wasn't broken, it was accurately showing
+    that no updates existed. install.sh actually prints its own step
+    markers (">>> Downloading ollama...", ">>> Installing ollama to
+    /usr/local/bin...", etc.) plus a live ``curl --progress-bar`` percentage
+    while it downloads the ~700MB+ binary - both of those are captured and
+    forwarded here as real progress instead of being silently swallowed.
+
+    Returns ``(returncode, output_tail)`` - ``output_tail`` is the last
+    ~2000 chars of combined output, for error messages on failure.
+    """
+    proc = subprocess.Popen(
+        ["sh", "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+
+    all_output: list[str] = []
+    buf = ""
+    deadline = time.monotonic() + INSTALL_SUBPROCESS_TIMEOUT_S
+    last_emit = 0.0
+
+    def _flush(chunk: str) -> None:
+        nonlocal last_emit
+        chunk = chunk.strip()
+        if not chunk:
+            return
+        all_output.append(chunk)
+        # curl's --progress-bar writes a live "###   42.0%" style line via
+        # \r - surface that as a real percentage instead of just text.
+        m = _PERCENT_RE.search(chunk)
+        now = time.monotonic()
+        if m:
+            _emit(cb, "installing", f"Downloading Ollama\u2026 {float(m.group(1)):.0f}%",
+                  percent=float(m.group(1)))
+            last_emit = now
+        elif now - last_emit > 0.5:  # throttle plain status lines a bit
+            _emit(cb, "installing", chunk[:160])
+            last_emit = now
+
+    try:
+        assert proc.stdout is not None
+        while True:
+            ch = proc.stdout.read(1)
+            if ch == "":
+                if proc.poll() is not None:
+                    break
+                continue
+            if ch in ("\n", "\r"):
+                _flush(buf)
+                buf = ""
+            else:
+                buf += ch
+            if time.monotonic() > deadline:
+                proc.kill()
+                proc.wait()
+                raise InstallerError(
+                    "sh took too long to finish (over "
+                    f"{int(INSTALL_SUBPROCESS_TIMEOUT_S // 60)} minutes).",
+                    "\n".join(all_output[-50:]),
+                )
+        _flush(buf)
+        returncode = proc.wait()
+    except FileNotFoundError as exc:
+        raise InstallerError("Couldn't run 'sh' - it isn't on this device.", str(exc)) from exc
+
+    return returncode, "\n".join(all_output)[-2000:]
+
+
 def _install_linux(cb: ProgressCB, sudo_password_provider: SudoPasswordProvider = None) -> None:
     """Official install script - always fetches the current stable build,
     same command ollama.com documents for every distro/architecture.
@@ -324,17 +412,13 @@ def _install_linux(cb: ProgressCB, sudo_password_provider: SudoPasswordProvider 
         else:
             _emit(cb, "installing", "Installing Ollama\u2026")
 
-        result = subprocess.run(
-            ["sh", "-c", script],
-            capture_output=True, text=True, timeout=INSTALL_SUBPROCESS_TIMEOUT_S,
-            env=env,
-        )
+        returncode, output_tail = _run_install_script_streaming(script, env, cb)
     finally:
         if askpass_dir:
             shutil.rmtree(askpass_dir, ignore_errors=True)
 
-    if result.returncode != 0:
-        stderr_tail = result.stderr[-2000:]
+    if returncode != 0:
+        stderr_tail = output_tail
         lowered = stderr_tail.lower()
         if needs_password and (
             "incorrect password" in lowered
@@ -464,6 +548,91 @@ def install(cb: ProgressCB = None, sudo_password_provider: SudoPasswordProvider 
 # Start
 # --------------------------------------------------------------------------
 
+def _running_server_pids(port: int = 11434) -> list[int]:
+    """Best-effort PIDs of whatever's bound to Ollama's port, without
+    killing anything - used to check the *existing* server's environment
+    before deciding whether it needs a restart."""
+    system = platform.system()
+    if system == "Windows":
+        return []
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return []
+    try:
+        result = subprocess.run(
+            [lsof, "-ti", f":{port}"], capture_output=True, text=True, timeout=5,
+        )
+        return [int(p) for p in result.stdout.split() if p.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _server_has_no_cloud_env(port: int = 11434) -> Optional[bool]:
+    """Best-effort check of whether an *already-running* ``ollama serve``
+    has ``OLLAMA_NO_CLOUD`` set in its own environment (Linux only, via
+    ``/proc/<pid>/environ`` - macOS/Windows have no equivalent unprivileged
+    way to read another process's environment, so this returns None there
+    and the caller treats that as "unknown, leave it alone").
+
+    Returns True/False when it can tell, None when it genuinely can't.
+    """
+    if platform.system() != "Linux":
+        return None
+    for pid in _running_server_pids(port):
+        try:
+            raw = Path(f"/proc/{pid}/environ").read_bytes()
+        except (OSError, PermissionError):
+            continue
+        entries = raw.split(b"\x00")
+        for entry in entries:
+            if entry.startswith(b"OLLAMA_NO_CLOUD="):
+                value = entry.split(b"=", 1)[1].decode("utf-8", "replace")
+                return value not in ("", "0", "false", "False")
+        # Found the process's environ but no OLLAMA_NO_CLOUD key at all.
+        return False
+    return None
+
+
+def _kill_stale_server_on_port(port: int = 11434) -> bool:
+    """Best-effort: find whatever process is bound to Ollama's port and
+    kill it. Used when we're about to (re)start Ollama but something is
+    already squatting on the port without actually serving requests
+    properly (a wedged/zombie ``ollama serve`` - it can still answer
+    ``/api/tags`` while pulls or generates hang forever). Returns True if
+    something was found and killed."""
+    system = platform.system()
+    if system == "Windows":
+        return False
+    pids = _running_server_pids(port)
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+    time.sleep(1.0)
+    return True
+
+
+def _serve_env() -> dict:
+    """Environment for launching ``ollama serve``, with ``OLLAMA_NO_CLOUD=1``
+    set unless the person has already configured it explicitly themselves.
+
+    Without this, Ollama tries to reach its cloud-model integration during
+    a pull, which on some networks (proxies, firewalls, no outbound access
+    to the cloud auth endpoint) hangs the manifest fetch indefinitely with
+    no error - it just sits on "pulling manifest" forever, since the
+    cloud handshake never times out on its own. Running ``ollama serve``
+    with this set is the documented workaround, and confirmed to fix
+    exactly that symptom - so the app does it automatically instead of
+    requiring the person to notice and set it by hand every launch.
+    """
+    env = os.environ.copy()
+    env.setdefault("OLLAMA_NO_CLOUD", "1")
+    return env
+
+
 def start(cb: ProgressCB = None) -> None:
     """Launch the local Ollama server in the background and wait for it to
     answer, raising :class:`InstallerError` if it never comes up."""
@@ -474,10 +643,29 @@ def start(cb: ProgressCB = None) -> None:
         # The macOS app bundle runs its own menu-bar server; launching it
         # is the supported way to start the service (vs. invoking the CLI
         # server subprocess directly, which the app bundle install doesn't
-        # expose the same way the Linux/Windows CLI installs do).
+        # expose the same way the Linux/Windows CLI installs do). `open`
+        # launches it via LaunchServices, which does NOT inherit this
+        # process's environment - `launchctl setenv` is the supported way
+        # to get OLLAMA_NO_CLOUD into a GUI app's environment on macOS.
+        # Best-effort: if it fails, we still launch the app rather than
+        # blocking startup on it.
+        try:
+            subprocess.run(["launchctl", "setenv", "OLLAMA_NO_CLOUD", "1"], timeout=5)
+        except Exception:
+            pass
         _run(["open", "-a", "Ollama"], timeout=15)
     else:
         binary = find_binary()
+        if binary is None:
+            try:
+                result = subprocess.run(
+                    ["sh", "-lc", "command -v ollama"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    binary = result.stdout.strip().splitlines()[0]
+            except Exception:
+                pass
         if binary is None:
             raise InstallerError("Ollama isn't installed on this device yet.")
         creationflags = 0
@@ -492,6 +680,7 @@ def start(cb: ProgressCB = None) -> None:
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
                 start_new_session=(system != "Windows"),
+                env=_serve_env(),
                 **kwargs,
             )
         except OSError as exc:
@@ -503,6 +692,34 @@ def start(cb: ProgressCB = None) -> None:
             _emit(cb, "done", "Ollama is running.")
             return
         time.sleep(START_POLL_INTERVAL_S)
+
+    # Didn't come up in time - often means something is already bound to
+    # the port but wedged (answers nothing, or answers /api/tags but not
+    # real requests). Kill it and give the real server one more shot
+    # before giving up, rather than leaving the person to find and kill
+    # the stale process by hand.
+    if _kill_stale_server_on_port():
+        _emit(cb, "starting", "Clearing a stuck Ollama process and retrying\u2026")
+        try:
+            subprocess.Popen(
+                [binary, "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=(system != "Windows"),
+                env=_serve_env(),
+                **kwargs,
+            )
+        except OSError as exc:
+            raise InstallerError(f"Couldn't start Ollama: {exc}", str(exc)) from exc
+
+        retry_deadline = time.monotonic() + START_POLL_TIMEOUT_S
+        while time.monotonic() < retry_deadline:
+            if is_running(timeout=2.0):
+                _emit(cb, "done", "Ollama is running.")
+                return
+            time.sleep(START_POLL_INTERVAL_S)
+
     raise InstallerError(
         "Ollama was installed but didn't start responding within "
         f"{START_POLL_TIMEOUT_S} seconds. Try launching it manually, then "
@@ -526,10 +743,42 @@ def ensure_ollama(cb: ProgressCB = None, sudo_password_provider: SudoPasswordPro
     _emit(cb, "detecting", "Checking for Ollama\u2026")
     state = detect()
     if state.running:
+        # Already running doesn't necessarily mean *correctly* running - if
+        # this instance was started outside the app (a login/system service,
+        # a plain `ollama serve` in some other terminal, etc.) it may be
+        # missing OLLAMA_NO_CLOUD, which is what makes model pulls hang
+        # forever on "pulling manifest" on networks that can't reach
+        # Ollama's cloud endpoint (see _serve_env() above) - a symptom
+        # that's otherwise indistinguishable from the app itself being
+        # broken. Restart it under our own controlled environment whenever
+        # we can positively confirm it's missing that setting, so "Ollama
+        # is already running" never quietly leaves a pull-breaking server
+        # in place. If we can't tell (non-Linux, or the check itself
+        # fails), leave it alone rather than restarting a server that may
+        # be fine.
+        if _server_has_no_cloud_env() is not True:  
+            _emit(cb, "starting", "Restarting Ollama with cloud pulls disabled\u2026")
+            if _kill_stale_server_on_port():
+                start(cb)
+                return
         _emit(cb, "done", "Ollama is already running.")
         return
     if not state.installed:
-        install(cb, sudo_password_provider)
+        # Belt-and-suspenders: find_binary()'s candidate list can miss a
+        # real install (unusual install path, PATH not visible to this
+        # process, etc). Before treating this as NOT_INSTALLED and running
+        # the installer, do one more direct check via a shell so PATH is
+        # resolved the same way a terminal would.
+        try:
+            result = subprocess.run(
+                ["sh", "-lc", "command -v ollama"],
+                capture_output=True, text=True, timeout=5,
+            )
+            shell_found = result.returncode == 0 and result.stdout.strip()
+        except Exception:
+            shell_found = False
+        if not shell_found:
+            install(cb, sudo_password_provider)
     start(cb)
 
 

@@ -204,19 +204,29 @@ def run_benchmark(
 
     created_utc = inference.utc_timestamp()
     if conn is not None:
-        store.insert_run(
-            conn,
-            benchmark_run_id=run_id,
-            created_utc=created_utc,
-            status="running",
-            model=model_name,
-            datasets=dataset_list,
-            run_dir=str(paths.root),
-            model_digest=digest,
-            question_count=run_question_count,
-            app_version=APP_VERSION,
-            protocol_version=config.PROTOCOL_VERSION,
-        )
+        existing_run = conn.execute(
+            "SELECT 1 FROM runs WHERE benchmark_run_id = ?", (run_id,)
+        ).fetchone()
+        if existing_run is not None:
+            # Resuming a run_id that already has a row (e.g. continuing an
+            # interrupted run across an app restart) - update it in place
+            # instead of a plain INSERT, which would otherwise raise on the
+            # benchmark_run_id primary key conflict.
+            store.set_run_status(conn, run_id, "running")
+        else:
+            store.insert_run(
+                conn,
+                benchmark_run_id=run_id,
+                created_utc=created_utc,
+                status="running",
+                model=model_name,
+                datasets=dataset_list,
+                run_dir=str(paths.root),
+                model_digest=digest,
+                question_count=run_question_count,
+                app_version=APP_VERSION,
+                protocol_version=config.PROTOCOL_VERSION,
+            )
 
     outcomes: list[DatasetOutcome] = []
     all_metrics: list[dict[str, Any]] = []
@@ -322,6 +332,7 @@ def run_benchmark(
                 dataset=dataset,
                 config_fingerprint=fp,
                 metrics=dataset_summary,
+                model=model_name,
             )
 
         outcomes.append(

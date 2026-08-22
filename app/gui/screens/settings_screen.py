@@ -7,9 +7,9 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
-from app.gui.widgets import card, h2, body, faint, SectionHeader, centered_column
+from app.gui.widgets import card, h2, body, SectionHeader, centered_column
 
-# TODO: replace with the real PRISM project website once it's live.
+# TODO: replace with the real PRISM website once it's live.
 PRISM_WEBSITE_URL = "https://prism-project.example.com"
 PRISM_DOCS_URL = "https://prism-project.example.com/docs"
 
@@ -36,7 +36,7 @@ class SettingsScreen(QWidget):
         scroll.setWidget(content)
         root = centered_column(content, max_width=760, margins=(28, 36, 28, 36), spacing=22)
 
-        root.addWidget(SectionHeader("Settings", "Appearance and app information."))
+        root.addWidget(SectionHeader("Settings"))
 
         appearance = card("Card")
         al = QVBoxLayout(appearance)
@@ -48,8 +48,8 @@ class SettingsScreen(QWidget):
         row.addWidget(body("Choose the theme PRISM runs in."))
         row.addStretch(1)
 
-        self.dark_btn = QPushButton("Dusk (dark)")
-        self.light_btn = QPushButton("Paper (light)")
+        self.dark_btn = QPushButton("Dark Mode")
+        self.light_btn = QPushButton("Light Mode")
         for b in (self.dark_btn, self.light_btn):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setCheckable(True)

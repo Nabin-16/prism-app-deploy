@@ -141,6 +141,7 @@ def seed_bundled_results(conn: sqlite3.Connection, runs_root: Path) -> list[str]
                 dataset=row["dataset"],
                 config_fingerprint=fp,
                 metrics=metrics,
+                model=model_tag,
             )
 
         seeded.append(model_tag)
