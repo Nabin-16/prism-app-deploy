@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QPushButton
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QFrame, QPushButton,
+    QScrollArea,
+)
 
-from app.gui.widgets import card, h2, body, faint, divider, SectionHeader
+from app.gui.widgets import card, h2, body, faint, SectionHeader, centered_column
 
 # TODO: replace with the real PRISM project website once it's live.
 PRISM_WEBSITE_URL = "https://prism-project.example.com"
@@ -18,9 +19,22 @@ class SettingsScreen(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(36, 32, 36, 32)
-        root.setSpacing(22)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Same centred, width-capped, scrollable composition as the
+        # Startup and Benchmark screens, so Settings reads as part of the
+        # same app instead of stretching its cards full-bleed edge to edge.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        outer.addWidget(scroll)
+
+        content = QWidget()
+        scroll.setWidget(content)
+        root = centered_column(content, max_width=760, margins=(28, 36, 28, 36), spacing=22)
 
         root.addWidget(SectionHeader("Settings", "Appearance and app information."))
 
@@ -54,30 +68,33 @@ class SettingsScreen(QWidget):
 
         bl.addWidget(body(
             "<b>PRISM (Prompt Reliability Through Intelligent Semantic "
-            "Multiplexing)</b> is a benchmark and local desktop application "
-            "for evaluating how small, locally runnable language models "
-            "behave when the same question is presented through different, "
-            "semantically equivalent prompt formulations."
+            "Multiplexing)</b> is a benchmark and desktop application for "
+            "evaluating the behavioral consistency of small, locally "
+            "runnable language models. It measures how a model's output "
+            "changes when a single underlying question is presented "
+            "through multiple, semantically equivalent prompt "
+            "formulations."
         ))
         bl.addWidget(body(
-            "It was created to make prompt-dependent model behavior "
-            "directly observable and measurable rather than leaving it as "
-            "an assumption."
+            "The objective is to make prompt-dependent variation in model "
+            "behavior an observable, quantifiable property rather than an "
+            "implicit assumption of model evaluation."
         ))
         bl.addWidget(body(
-            "PRISM sends the same question through several prompt "
-            "formulations, evaluates each response independently, and "
-            "reports where a model's behavior stayed stable and where it "
-            "did not."
+            "For each question, PRISM issues the same underlying query "
+            "through several distinct prompt formulations, evaluates each "
+            "resulting response independently, and reports the degree to "
+            "which the model's behavior remained stable across those "
+            "formulations."
         ))
         bl.addWidget(body(
-            "The desktop application performs benchmark execution locally, "
-            "while the public website provides documentation and access to "
-            "published benchmark results."
+            "Benchmark execution takes place entirely on the local device. "
+            "The accompanying website provides documentation and access "
+            "to previously published benchmark results."
         ))
 
         links_row = QHBoxLayout()
-        self.website_btn = QPushButton("Download the app")
+        self.website_btn = QPushButton("Visit Website")
         self.docs_btn = QPushButton("Documentation")
         for b in (self.website_btn, self.docs_btn):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -96,35 +113,22 @@ class SettingsScreen(QWidget):
         wl = QVBoxLayout(what_card)
         wl.setContentsMargins(16, 14, 16, 14)
         wl.setSpacing(6)
-        wl.addWidget(h2("What PRISM does"))
+        wl.addWidget(h2("Methodology"))
         wl.addWidget(body(
-            "1. Presents the same underlying question through <b>five "
-            "distinct prompt formulations</b>."
+            "1. Each question is presented through <b>five distinct "
+            "prompt formulations</b>."
         ))
         wl.addWidget(body(
-            "2. Evaluates each response independently for <b>correctness, "
-            "instruction compliance, and answer recoverability</b>."
+            "2. Each resulting response is evaluated independently for "
+            "<b>correctness, instruction compliance, and answer "
+            "recoverability</b>."
         ))
         wl.addWidget(body(
-            "3. Reports where a model's behavior <b>stayed stable</b> and "
-            "where it <b>did not</b> across those formulations."
+            "3. Results indicate where a model's behavior <b>remained "
+            "stable</b> and where it <b>diverged</b> across those "
+            "formulations."
         ))
         bl.addWidget(what_card)
-
-        bl.addWidget(faint("Protocol 1.0 · Templates 1.0 · Local-only inference · Temperature 0"))
-        bl.addWidget(faint(
-            "This project is developed as part of a 6th semester computer "
-            "engineering curriculum."
-        ))
-
-        data_row = QHBoxLayout()
-        data_row.addWidget(faint("Local data lives at:"))
-        data_row.addStretch(1)
-        bl.addLayout(data_row)
-        path_lbl = QLabel(str(Path.home() / ".prism"))
-        path_lbl.setObjectName("Faint")
-        path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        bl.addWidget(path_lbl)
         root.addWidget(about)
 
         root.addStretch(1)

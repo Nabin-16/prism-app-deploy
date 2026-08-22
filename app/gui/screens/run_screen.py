@@ -154,6 +154,7 @@ class RunScreen(QWidget):
         pl.addLayout(status_head)
         self.status_sub = QLabel("Configure a run above and press Start.")
         self.status_sub.setObjectName("Body")
+        self.status_sub.setWordWrap(True)
         pl.addWidget(self.status_sub)
 
         overall_lbl_row = QHBoxLayout()
@@ -219,6 +220,11 @@ class RunScreen(QWidget):
         # errors, driven by _on_stage/_on_progress/_on_finished/
         # _on_fatal_halt below. Read-only so it can't be edited, monospace
         # so timestamps/markers line up.
+        #
+        # UI-hidden by design: log_card is built but never added to `root`,
+        # so nothing renders it. self.log itself is left fully intact and
+        # keeps receiving every appendPlainText()/clear() call below exactly
+        # as before - only its visibility changed, not its behavior.
         log_card = card("Card")
         ll = QVBoxLayout(log_card)
         ll.setContentsMargins(22, 18, 22, 18)
@@ -234,7 +240,7 @@ class RunScreen(QWidget):
         log_font.setFamily("Menlo, Consolas, monospace")
         self.log.setFont(log_font)
         ll.addWidget(self.log)
-        root.addWidget(log_card)
+        # (intentionally not added to `root` - see note above)
 
         # ---- Crash-safe error banner (OOM / crash / lost connection) ----
         # Shown only when inference halts on a fatal condition. The app

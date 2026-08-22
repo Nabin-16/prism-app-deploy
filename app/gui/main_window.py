@@ -6,7 +6,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QActionGroup, QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QStackedWidget, QToolBar, QStatusBar,
-    QLabel, QPushButton,
+    QLabel, QPushButton, QMessageBox,
 )
 
 from app.gui.theme import DUSK, PAPER, build_qss
@@ -38,7 +38,12 @@ class MainWindow(QMainWindow):
         if LOGO_ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(LOGO_ICON_PATH)))
         self.resize(1220, 780)
-        self.setMinimumSize(1000, 660)
+        # Low enough to still be usable on a 13" laptop panel (1280x800
+        # native, minus OS chrome) or a split-screen/tiled window, while
+        # every screen's own QScrollArea (dashboard/benchmark/startup)
+        # takes over instead of clipping content once a screen's natural
+        # content is taller than the available space.
+        self.setMinimumSize(860, 560)
 
         self.active_model: str | None = None
         self._theme = app_state.get_theme()
@@ -191,6 +196,50 @@ class MainWindow(QMainWindow):
         else:
             self._show_app_chrome()
 
+    def closeEvent(self, event) -> None:
+        """Warn before closing if something's actively in-flight that would
+        be silently killed - a running benchmark, an Ollama install, or a
+        model pull - rather than letting the window vanish mid-task."""
+        reasons = self._in_progress_reasons()
+        if not reasons:
+            super().closeEvent(event)
+            return
+
+        if len(reasons) == 1:
+            detail = f"{reasons[0]} is still running."
+        else:
+            detail = "The following are still running:\n\u2022 " + "\n\u2022 ".join(reasons)
+
+        choice = QMessageBox.warning(
+            self,
+            "Work in progress",
+            f"{detail}\n\nClosing PRISM now will stop it before it finishes. "
+            "Are you sure you want to quit?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+    def _in_progress_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        worker = getattr(self.run_screen, "worker", None)
+        if worker is not None and worker.isRunning():
+            reasons.append("A benchmark run")
+        install_worker = getattr(self.startup_screen, "_install_worker", None)
+        if install_worker is not None and install_worker.isRunning():
+            reasons.append("Installing/starting Ollama")
+        pulling = [
+            tag for tag, w in getattr(self.startup_screen, "pull_workers", {}).items()
+            if w.isRunning()
+        ]
+        if pulling:
+            label = "A model download" if len(pulling) == 1 else f"{len(pulling)} model downloads"
+            reasons.append(f"{label} ({', '.join(pulling)})")
+        return reasons
+
     # ---------------- navigation ----------------
 
     def _show_startup_chrome(self) -> None:
@@ -226,6 +275,18 @@ class MainWindow(QMainWindow):
         self.content_stack.setCurrentWidget(widget)
 
     def _on_model_chosen(self, model_tag: str) -> None:
+        # Same defensive re-check as _on_skip_to_dashboard - this signal is
+        # only emitted once StartupScreen has verified Ollama is connected
+        # and the model is pulled, but navigation off the startup screen
+        # must never rely on a single code path getting that right.
+        if not backend.ollama_available():
+            QMessageBox.warning(
+                self,
+                "Ollama isn't running",
+                "Ollama needs to be installed and running before you can use "
+                "PRISM. Please finish setup on the previous screen first.",
+            )
+            return
         self._show_app_chrome()
         self.active_model = model_tag
         self.model_badge.set_model(backend.model_label(model_tag))
@@ -240,6 +301,19 @@ class MainWindow(QMainWindow):
         self._show_tab("benchmark")
 
     def _on_skip_to_dashboard(self) -> None:
+        # Belt-and-suspenders: the skip link itself is only shown when
+        # Ollama is connected (see StartupScreen._refresh_skip_link_visibility),
+        # but never trust a signal alone to gate navigation - re-check here
+        # too, since this is the one place that can move the user off the
+        # startup screen.
+        if not backend.ollama_available():
+            QMessageBox.warning(
+                self,
+                "Ollama isn't running",
+                "Ollama needs to be installed and running before you can use "
+                "PRISM. Please finish setup on the previous screen first.",
+            )
+            return
         self._show_app_chrome()
         conn = backend.get_conn()
         model_tag = app_state.get_selected_model()

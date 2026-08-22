@@ -65,6 +65,16 @@ def ollama_available() -> bool:
     return ollama.is_available()
 
 
+def ollama_installed_on_device() -> bool:
+    from prism_core import ollama_installer
+    return ollama_installer.is_installed()
+
+
+def ollama_auto_install_supported() -> bool:
+    from prism_core import ollama_installer
+    return ollama_installer.is_platform_supported()
+
+
 def installed_model_tags() -> set[str]:
     try:
         names = {m.name for m in ollama.list_models()}
@@ -151,6 +161,35 @@ def check_ram_for_model(model_tag: str) -> Optional[tuple[float, float]]:
     if available < required:
         return required, available
     return None
+
+
+# A device with less than this fraction of a model's recommended RAM isn't
+# just "may run slowly" territory - the model is very unlikely to load at
+# all (Ollama will typically fail outright or the OS will refuse the
+# allocation). Below this threshold the app hard-blocks instead of asking
+# "continue anyway?".
+_HARD_INCOMPATIBLE_RATIO = 0.5
+
+
+def model_compatibility_error(model_tag: str) -> Optional[str]:
+    """Returns a ready-to-display error message if ``model_tag`` is so far
+    beyond this device's capability that pulling/running it should be
+    blocked outright (not just warned about), or ``None`` if it's fine or
+    merely marginal (see :func:`check_ram_for_model` for the soft warning)."""
+    required = estimate_model_ram_gb(model_tag)
+    available = system_ram_gb()
+    if required is None or available is None:
+        return None
+    if available >= required * _HARD_INCOMPATIBLE_RATIO:
+        return None
+    return (
+        f"\u201c{model_tag}\u201d cannot run on this device.\n\n"
+        f"It recommends about {required:.0f} GB of RAM to load, but this "
+        f"device only has about {available:.1f} GB total. This is too far "
+        "below the requirement for Ollama to load the model at all - "
+        "downloading it would just fail partway through inference.\n\n"
+        "Choose a smaller model instead."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -302,6 +341,61 @@ class PullWorker(QThread):
             self.finished_ok.emit(False, "Cancelled")
         except ollama.OllamaError as exc:
             self.finished_ok.emit(False, str(exc))
+
+
+class OllamaInstallWorker(QThread):
+    """Runs ``ollama_installer.ensure_ollama`` (detect -> install -> start)
+    on a background thread so the GUI never blocks/freezes on what can be a
+    multi-minute download+install. Progress is re-emitted as a Qt signal;
+    any :class:`ollama_installer.InstallerError` is turned into a plain
+    message string for the caller to show in a blocking error dialog.
+
+    On Linux, the official install script needs sudo - but it runs
+    headless with no terminal attached, so it can't prompt for a password
+    itself. When (and only when) that's actually necessary, this worker
+    emits ``password_needed`` and blocks until the GUI thread calls
+    :meth:`supply_password` with what the user typed (or ``None`` if they
+    cancelled), so the user is asked right there in the app instead of
+    having to go type it in a terminal.
+    """
+
+    progress = Signal(str, str, float)   # stage, message, percent (-1 = indeterminate)
+    finished_ok = Signal(bool, str)  # ok, error_message ("" on success)
+    password_needed = Signal()  # ask the GUI thread to prompt for a sudo password
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._pw_event = threading.Event()
+        self._pw_value: Optional[str] = None
+
+    def supply_password(self, password: Optional[str]) -> None:
+        """Called from the GUI thread once the user has answered the sudo
+        password prompt (or cancelled it, with ``password=None``)."""
+        self._pw_value = password
+        self._pw_event.set()
+
+    def _request_password(self) -> Optional[str]:
+        # Runs on this worker's own thread; blocks until the GUI thread
+        # (which receives ``password_needed`` via a queued connection)
+        # answers via ``supply_password``.
+        self._pw_event.clear()
+        self.password_needed.emit()
+        self._pw_event.wait()
+        return self._pw_value
+
+    def run(self) -> None:
+        from prism_core import ollama_installer
+
+        def on_progress(p) -> None:
+            self.progress.emit(p.stage, p.message, float(p.percent) if p.percent is not None else -1.0)
+
+        try:
+            ollama_installer.ensure_ollama(cb=on_progress, sudo_password_provider=self._request_password)
+            self.finished_ok.emit(True, "")
+        except ollama_installer.InstallerError as exc:
+            self.finished_ok.emit(False, str(exc))
+        except Exception as exc:  # noqa: BLE001 - never let an install crash the GUI thread
+            self.finished_ok.emit(False, f"Unexpected error installing Ollama: {exc}")
 
 
 class SyncWorker(QThread):

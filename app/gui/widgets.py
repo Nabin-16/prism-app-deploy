@@ -71,12 +71,14 @@ def card(object_name: str = "Card") -> QFrame:
 def h1(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setObjectName("H1")
+    lbl.setWordWrap(True)
     return lbl
 
 
 def h2(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setObjectName("H2")
+    lbl.setWordWrap(True)
     return lbl
 
 
@@ -123,8 +125,10 @@ class StatTile(QFrame):
         lay.setSpacing(4)
         self.value_lbl = QLabel(value)
         self.value_lbl.setObjectName("Stat")
+        self.value_lbl.setWordWrap(True)
         self.label_lbl = QLabel(label.upper())
         self.label_lbl.setObjectName("StatLabel")
+        self.label_lbl.setWordWrap(True)
         lay.addWidget(self.value_lbl)
         lay.addWidget(self.label_lbl)
 
@@ -161,11 +165,14 @@ class MetricTile(QFrame):
         lay.setSpacing(4)
         self.value_lbl = QLabel(value)
         self.value_lbl.setObjectName("MetricValue")
+        self.value_lbl.setWordWrap(True)
         self.compare_lbl = QLabel("")
         self.compare_lbl.setObjectName("MetricCompare")
+        self.compare_lbl.setWordWrap(True)
         self.compare_lbl.setVisible(False)
         self.label_lbl = QLabel(label.upper())
         self.label_lbl.setObjectName("MetricLabel")
+        self.label_lbl.setWordWrap(True)
         lay.addWidget(self.value_lbl)
         lay.addWidget(self.compare_lbl)
         lay.addWidget(self.label_lbl)
@@ -197,11 +204,20 @@ class ModelBadge(QFrame):
         self.caption.setObjectName("ModelBadgeCaption")
         self.text = QLabel("None selected")
         self.text.setObjectName("ModelBadgeText")
+        # Elide (never wrap - it must stay one line in the toolbar) so a
+        # long custom model tag on a narrow window shrinks its label
+        # instead of pushing the toolbar's other buttons off-screen.
+        self.text.setMaximumWidth(180)
+        self.text.setToolTip("None selected")
         lay.addWidget(self.caption)
         lay.addWidget(self.text)
 
     def set_model(self, label: str) -> None:
-        self.text.setText(label)
+        from PySide6.QtGui import QFontMetrics
+        metrics = QFontMetrics(self.text.font())
+        elided = metrics.elidedText(label, Qt.TextElideMode.ElideRight, self.text.maximumWidth())
+        self.text.setText(elided)
+        self.text.setToolTip(label)
 
 
 class EmptyStateCTA(QFrame):

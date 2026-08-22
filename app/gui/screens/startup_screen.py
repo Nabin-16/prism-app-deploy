@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QLineEdit, QProgressBar, QMessageBox,
+    QFrame, QLineEdit, QProgressBar, QMessageBox, QScrollArea, QInputDialog,
 )
 
 from app.gui.widgets import pill, card, h2, body, faint, SectionHeader, centered_column
@@ -43,12 +43,14 @@ class ModelRow(QFrame):
         text_col.setSpacing(1)
         name_lbl = QLabel(label)
         name_lbl.setObjectName("H2")
+        name_lbl.setWordWrap(True)
         tag_lbl = QLabel(model_tag)
         tag_lbl.setObjectName("Faint")
+        tag_lbl.setWordWrap(True)
         text_col.addWidget(name_lbl)
         text_col.addWidget(tag_lbl)
-        top.addLayout(text_col)
-        top.addStretch(1)
+        top.addLayout(text_col, 1)
+        top.addStretch(0)
 
         self.status_pill = pill("CHECKING\u2026", "#9c99a8", "transparent")
         top.addWidget(self.status_pill, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -158,16 +160,27 @@ class StartupScreen(QWidget):
         self.setObjectName("StartupRoot")
         self._existing_results = False
         self._connected = False
+        self._install_worker = None  # backend.OllamaInstallWorker | None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # A real scroll area (matching Dashboard/Benchmark) so this screen
+        # never clips its model list or buttons below a window's visible
+        # height on small displays/laptops - it scrolls instead of hiding
+        # content or forcing the window to grow past the screen.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        root.addWidget(scroll)
+
         # Centered, width-capped content column (same pattern as the
         # Benchmark screen) so the page reads as a focused setup panel
-        # instead of stretching full-bleed across a wide window.
+        # instead of stretching full-bleed across a wide window, while
+        # still shrinking gracefully on narrow windows.
         content = QWidget()
-        root.addWidget(content)
+        scroll.setWidget(content)
         inner = centered_column(content, max_width=760, margins=(28, 36, 28, 36), spacing=22)
 
         inner.addWidget(SectionHeader(
@@ -177,11 +190,11 @@ class StartupScreen(QWidget):
         # ---- Ollama connection status card ----
         conn_card = card("CardFlat")
         conn_lay = QVBoxLayout(conn_card)
-        conn_lay.setContentsMargins(20, 16, 20, 16)
-        conn_lay.setSpacing(6)
+        conn_lay.setContentsMargins(24, 22, 24, 22)
+        conn_lay.setSpacing(14)
 
         conn_top = QHBoxLayout()
-        conn_top.setSpacing(10)
+        conn_top.setSpacing(12)
         self.status_dot = QLabel("\u25cf")
         self.status_dot.setObjectName("StatusDotPending")
         conn_top.addWidget(self.status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -191,14 +204,36 @@ class StartupScreen(QWidget):
         self.status_pill = pill("CHECKING\u2026", "#9c99a8", "transparent")
         conn_top.addWidget(self.status_pill, 0, Qt.AlignmentFlag.AlignVCenter)
         conn_top.addStretch(1)
+        self.install_btn = QPushButton("Install Ollama")
+        self.install_btn.setObjectName("Primary")
+        self.install_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.install_btn.setVisible(False)
+        self.install_btn.setFixedHeight(38)
+        self.install_btn.clicked.connect(self._on_install_clicked)
+        conn_top.addWidget(self.install_btn)
+
         self.refresh_btn = QPushButton("Refresh Status")
         self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_btn.setFixedHeight(38)
         self.refresh_btn.clicked.connect(self._check_ollama)
         conn_top.addWidget(self.refresh_btn)
         conn_lay.addLayout(conn_top)
 
         self.status_detail = faint("Checking localhost:11434 for a running Ollama instance\u2026")
+        self.status_detail.setMinimumHeight(20)
         conn_lay.addWidget(self.status_detail)
+
+        # Progress bar for the Ollama install itself (download % when known,
+        # a busy/indeterminate bar for steps like "running the installer"
+        # or "starting the service" where there's no percentage to show).
+        self.install_progress = QProgressBar()
+        self.install_progress.setRange(0, 100)
+        self.install_progress.setValue(0)
+        self.install_progress.setFixedHeight(16)
+        self.install_progress.setTextVisible(True)
+        self.install_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.install_progress.setVisible(False)
+        conn_lay.addWidget(self.install_progress)
 
         inner.addWidget(conn_card)
 
@@ -303,7 +338,15 @@ class StartupScreen(QWidget):
 
     def set_existing_results_available(self, available: bool) -> None:
         self._existing_results = available
-        self.skip_link.setVisible(available)
+        self._refresh_skip_link_visibility()
+
+    def _refresh_skip_link_visibility(self) -> None:
+        # Never offer a way past this screen - not even to view old results
+        # - unless Ollama is actually installed and running right now. A
+        # user with existing local data but no working Ollama still can't
+        # benchmark or use the rest of the app, so they must not be able to
+        # slip past this gate.
+        self.skip_link.setVisible(self._existing_results and self._connected)
 
     def _check_ollama(self) -> None:
         self.status_dot.setObjectName("StatusDotPending")
@@ -319,18 +362,102 @@ class StartupScreen(QWidget):
             self._refresh_dot_style()
             self.status_pill.setText("CONNECTED")
             self.status_pill.setStyleSheet("background: rgba(95,209,142,0.15); color:#5fd18e;")
+            self._refresh_skip_link_visibility()
             self._show_model_picker()
         else:
             self._connected = False
+            self._refresh_skip_link_visibility()
             self.status_dot.setObjectName("StatusDotBad")
             self._refresh_dot_style()
             self.status_pill.setText("NOT FOUND")
             self.status_pill.setStyleSheet("background: rgba(234,107,107,0.15); color:#ea6b6b;")
-            self.status_detail.setText(
-                "Ollama isn't reachable at localhost:11434. Install it from "
-                "ollama.com, run `ollama serve`, then refresh status."
-            )
+
+            already_installed = backend.ollama_installed_on_device()
+            if already_installed:
+                self.status_detail.setText(
+                    "Ollama is installed on this device but isn't running. "
+                    "Click Install Ollama to start it, or refresh status if "
+                    "you've started it yourself."
+                )
+                self.install_btn.setText("Start Ollama")
+                self.install_btn.setVisible(True)
+            elif backend.ollama_auto_install_supported():
+                self.status_detail.setText(
+                    "Ollama isn't installed on this device. PRISM can install "
+                    "the latest stable release automatically."
+                )
+                self.install_btn.setText("Install Ollama")
+                self.install_btn.setVisible(True)
+            else:
+                self.status_detail.setText(
+                    "Ollama isn't reachable at localhost:11434, and this "
+                    "operating system isn't supported for automatic install. "
+                    "Install it manually from ollama.com, run it, then "
+                    "refresh status."
+                )
+                self.install_btn.setVisible(False)
             self._update_continue_btn()
+
+    def _on_install_clicked(self) -> None:
+        if self._install_worker is not None:
+            return
+        self.install_btn.setEnabled(False)
+        self.install_btn.setText("Working\u2026")
+        self.refresh_btn.setEnabled(False)
+        self.status_detail.setText("Setting up Ollama\u2026")
+        self.install_progress.setVisible(True)
+        self.install_progress.setRange(0, 0)  # indeterminate until we know a %
+
+        worker = backend.OllamaInstallWorker(self)
+        worker.progress.connect(self._on_install_progress)
+        worker.password_needed.connect(self._on_sudo_password_needed)
+        worker.finished_ok.connect(self._on_install_finished)
+        self._install_worker = worker
+        worker.start()
+
+    def _on_install_progress(self, stage: str, message: str, percent: float) -> None:
+        self.status_detail.setText(message)
+        if percent is not None and percent >= 0:
+            self.install_progress.setRange(0, 100)
+            self.install_progress.setValue(int(percent))
+        else:
+            # No concrete percentage for this step (installing/starting/
+            # detecting) - a busy bar still shows something is happening
+            # instead of the UI looking frozen.
+            self.install_progress.setRange(0, 0)
+
+    def _on_sudo_password_needed(self) -> None:
+        """Linux only: the install script needs sudo and this device isn't
+        already root / passworless-sudo, so ask right here in the app
+        instead of leaving the user to go type it into a terminal."""
+        worker = self._install_worker
+        if worker is None:
+            return
+        password, accepted = QInputDialog.getText(
+            self,
+            "Administrator password required",
+            "Installing Ollama needs administrator (sudo) access on Linux.\n"
+            "Enter your password to continue:",
+            QLineEdit.EchoMode.Password,
+        )
+        worker.supply_password(password if accepted and password else None)
+
+    def _on_install_finished(self, ok: bool, error_message: str) -> None:
+        self._install_worker = None
+        self.install_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        self.install_progress.setVisible(False)
+        if ok:
+            self._check_ollama()
+            return
+        # Window exception dialog: never leave the user staring at a stuck
+        # status line - surface exactly what went wrong and how to recover.
+        QMessageBox.critical(
+            self,
+            "Couldn't set up Ollama",
+            error_message or "An unknown error occurred while setting up Ollama.",
+        )
+        self._check_ollama()
 
     def _refresh_dot_style(self) -> None:
         colors = {
@@ -423,6 +550,13 @@ class StartupScreen(QWidget):
         this device's RAM looks too small for ``model_tag``. Returns True
         to proceed anyway, False to cancel. A model already installed
         skips the check entirely -- if it runs today, it'll keep running."""
+        # Hard block first: a device far below the model's requirement will
+        # not run it at all, so this is a blocking error, not a choice.
+        hard_error = backend.model_compatibility_error(model_tag)
+        if hard_error is not None:
+            QMessageBox.critical(self, "Model not supported on this device", hard_error)
+            return False
+
         shortfall = backend.check_ram_for_model(model_tag)
         if shortfall is None:
             return True
