@@ -92,23 +92,32 @@ PROTOCOL_VERSION: str = "1.0"
 # Runtime sync (app/services/supabase_sync.py) always uses the *anon* key - # safe to ship in a client build as long as supabase/schema.sql's RLS
 # policies restrict the anon role to insert/upsert on runs + run_results.
 # Ported from Karuna's env-var convention: PRISM_SUPABASE_URL /
-# PRISM_SUPABASE_ANON_KEY (read from a local .env via python-dotenv, or from
-# the real environment in a packaged build) override the values below, so a
-# packaged executable doesn't need the project's keys baked into source.
+# PRISM_SUPABASE_PUBLISHABLE_KEY (read from a local .env via python-dotenv, or
+# from the real environment in a packaged build) overrides the values below,
+# so a packaged executable doesn't need the project's keys baked into source.
 # The literals here are the fallback used when no environment/​.env value is
 # set (e.g. a source checkout with no .env configured yet).
 # No real project credentials are baked in here - set PRISM_SUPABASE_URL and
-# PRISM_SUPABASE_ANON_KEY as real environment variables (or in a local .env)
-# before packaging/running. Empty defaults mean sync is simply disabled
+# PRISM_SUPABASE_PUBLISHABLE_KEY as real environment variables (or in a local
+# .env) before packaging/running. Empty defaults mean sync is simply disabled
 # until configured, rather than silently pointing at someone else's project.
+# (PRISM_SUPABASE_ANON_KEY is still read as a fallback for projects still on
+# Supabase's legacy JWT-based keys.)
 SUPABASE_URL: str = os.environ.get("PRISM_SUPABASE_URL", "")
-SUPABASE_ANON_KEY: str = os.environ.get("PRISM_SUPABASE_ANON_KEY", "")
+SUPABASE_ANON_KEY: str = os.environ.get(
+    "PRISM_SUPABASE_PUBLISHABLE_KEY",
+    os.environ.get("PRISM_SUPABASE_ANON_KEY", ""),  # legacy fallback
+)
 
 # Admin-side push (scripts/push_bundled_results_to_supabase.py only - never
 # imported by the GUI). Mirrors Karuna's push_to_supabase.py: reads the
-# service_role key from the environment so it's never bundled into the
-# packaged executable at all.
-SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("PRISM_SUPABASE_SERVICE_ROLE_KEY", "")
+# secret key from the environment so it's never bundled into the packaged
+# executable at all. (PRISM_SUPABASE_SERVICE_ROLE_KEY is still read as a
+# fallback for projects still on Supabase's legacy JWT-based keys.)
+SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get(
+    "PRISM_SUPABASE_SECRET_KEY",
+    os.environ.get("PRISM_SUPABASE_SERVICE_ROLE_KEY", ""),  # legacy fallback
+)
 
 
 

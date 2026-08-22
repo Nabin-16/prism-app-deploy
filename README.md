@@ -1,4 +1,4 @@
-# PRISM — merged desktop app
+# PRISM — A desktop app
 
 A single PySide6 desktop application merging three source projects into
 one product:
@@ -20,10 +20,30 @@ one product:
 - **Supabase sync + GitHub publishing** — the anon-key sync pattern from
   `PRISM_app/PRISM_BUILD` combined with the CLI-script pattern from
   `Karuna`: the desktop app only ever writes to Supabase with the anon
-  key; a separate, maintainer-only GitHub Actions workflow
-  (`.github/workflows/sync-results.yml`) reads with the service_role key
-  and publishes moderated results into `models/<tag>/summary.json` in
-  this repo.
+  key. Publishing to the public repo is a separate, maintainer-only flow
+  split across two repos (see "Two-repo publishing flow" below) so the
+  public repo's git history never contains this repo's source code.
+
+## Two-repo publishing flow
+
+1. **This (private) repo** — app source. Every install syncs completed
+   runs into Supabase automatically with the publishable key
+   (`app/services/supabase_sync.py`). Rows land as `approved = false`.
+2. **Maintainer review, from this repo** — run
+   `scripts/approve_runs.py list` / `approve <run_id>` (needs
+   `PRISM_SUPABASE_SECRET_KEY` as a local env var only, never
+   committed) to review and approve individual runs.
+3. **Public repo** — a separate repo containing only `results/`,
+   `models/`, and its own `.github/workflows/sync-results.yml` +
+   `scripts/fetch_supabase_results.py`. A maintainer manually triggers
+   that repo's workflow (Actions → Run workflow); it reads only
+   `approved = true` rows from Supabase and commits the snapshot there.
+   Nothing from this private repo is ever checked out by that job.
+
+`scripts/push_bundled_results_to_supabase.py` is a separate, optional
+tool for the maintainer to push their own bundled/validated results
+straight into Supabase (as pre-approved) using the secret key —
+unrelated to the per-device publishable-key sync above.
 
 ## Visual style
 
@@ -64,14 +84,36 @@ No real credentials are checked into this repo. Copy `.env.example` to
 `.env` for local development, or set the same variables as real
 environment variables when packaging:
 
-- `PRISM_SUPABASE_URL` / `PRISM_SUPABASE_ANON_KEY` — used by the desktop
-  app's background sync. Safe to ship in a built executable as long as
-  Supabase Row Level Security restricts the anon role to insert/upsert
-  (see `supabase/schema.sql`).
-- `PRISM_SUPABASE_SERVICE_ROLE_KEY` — maintainer-only. Never used by the
-  GUI. Used locally by `scripts/push_bundled_results_to_supabase.py`, and
-  in CI (as `SUPABASE_SERVICE_KEY`) by `scripts/fetch_supabase_results.py`
-  via a GitHub Actions secret.
+- `PRISM_SUPABASE_URL` / `PRISM_SUPABASE_PUBLISHABLE_KEY` — used by the
+  desktop app's background sync. Safe to ship in a built executable as
+  long as Supabase Row Level Security restricts the anon role to
+  insert/upsert (see `supabase/schema.sql`). (`PRISM_SUPABASE_ANON_KEY`
+  is still read as a fallback if you're on Supabase's legacy JWT-based
+  keys instead of the newer publishable/secret key pair.)
+- `PRISM_SUPABASE_SECRET_KEY` — maintainer-only. **Never put this in
+  `.env` and never let it near app packaging** — `.env` is loaded
+  automatically every time the app runs, and `build.yml` only ever reads
+  `PRISM_SUPABASE_PUBLISHABLE_KEY`, so this key has no reason to be
+  anywhere the GUI or the build process can see it. Instead, export it
+  manually in your shell only when running a maintainer script:
+
+  ```bash
+  export PRISM_SUPABASE_URL="https://xxxxxxxx.supabase.co"
+  export PRISM_SUPABASE_SECRET_KEY="sk_..."
+  python scripts/approve_runs.py list
+  ```
+
+  Used only by `scripts/push_bundled_results_to_supabase.py` and
+  `scripts/approve_runs.py`. The public repo holds its own separate copy
+  of this key as a CI secret (`SUPABASE_SECRET_KEY`) for its own
+  `fetch_supabase_results.py`; this repo never sees or stores that CI
+  secret. (`PRISM_SUPABASE_SERVICE_ROLE_KEY` is still read as a fallback
+  for legacy JWT-based Supabase projects.)
+
+**If a secret/service_role key is ever accidentally written to a file, committed,
+or shared outside these two places, rotate it immediately** in Supabase →
+Project Settings → API → Reset service_role key, then update both the
+local env var here and the CI secret in the public repo.
 
 ## Packaging
 

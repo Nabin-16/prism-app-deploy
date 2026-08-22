@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QPushButton
 
 from app.gui.widgets import card, h2, body, faint, divider, SectionHeader
+
+# TODO: replace with the real PRISM project website once it's live.
+PRISM_WEBSITE_URL = "https://prism-project.example.com"
+PRISM_DOCS_URL = "https://prism-project.example.com/docs"
 
 
 class SettingsScreen(QWidget):
@@ -70,6 +75,22 @@ class SettingsScreen(QWidget):
             "while the public website provides documentation and access to "
             "published benchmark results."
         ))
+
+        links_row = QHBoxLayout()
+        self.website_btn = QPushButton("Download the app")
+        self.docs_btn = QPushButton("Documentation")
+        for b in (self.website_btn, self.docs_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.website_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(PRISM_WEBSITE_URL))
+        )
+        self.docs_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(PRISM_DOCS_URL))
+        )
+        links_row.addWidget(self.website_btn)
+        links_row.addWidget(self.docs_btn)
+        links_row.addStretch(1)
+        bl.addLayout(links_row)
 
         what_card = card("CardRaised")
         wl = QVBoxLayout(what_card)

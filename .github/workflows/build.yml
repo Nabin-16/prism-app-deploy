@@ -1,0 +1,58 @@
+name: Build desktop app (Windows / macOS / Ubuntu)
+
+# Builds the packaged PRISM executable for all three target OSes using the
+# existing prism.spec (PyInstaller). Only the ANON Supabase key is injected
+# here - this workflow must never reference PRISM_SUPABASE_SECRET_KEY.
+# The anon key is safe to bake into the binary because Supabase RLS
+# (supabase/schema.sql) restricts the anon role to insert/upsert only.
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: prism-windows
+          - os: macos-latest
+            artifact_name: prism-macos
+          - os: ubuntu-latest
+            artifact_name: prism-linux
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      # Anon key only. Safe to bake in - see supabase/schema.sql RLS policies.
+      PRISM_SUPABASE_URL: ${{ secrets.PRISM_SUPABASE_URL }}
+      PRISM_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.PRISM_SUPABASE_PUBLISHABLE_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller prism.spec --clean --noconfirm
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error

@@ -16,7 +16,15 @@ create table if not exists public.runs (
     protocol_version  text,
     run_dir           text not null,
     device_id         text,
-    synced_at         timestamptz not null default now()
+    synced_at         timestamptz not null default now(),
+
+    -- Maintainer approval gate. Every row lands here as pending (false);
+    -- nothing is published to the public repo until a maintainer flips
+    -- this to true (see scripts/approve_runs.py). The public-sync job
+    -- only ever reads rows where approved = true.
+    approved          boolean not null default false,
+    approved_at       timestamptz,
+    approved_by       text
 );
 
 create table if not exists public.run_results (
@@ -67,11 +75,16 @@ create policy "anon can insert runs"
     to anon
     with check (true);
 
+-- IMPORTANT: with check (approved = false) means an anon upsert can never
+-- set approved = true, and can never re-touch a row a maintainer already
+-- approved (that update would be rejected outright). Only the service_role
+-- key (used solely by scripts/approve_runs.py, held only as a maintainer-
+-- side CI/local secret) can flip approved to true.
 create policy "anon can update own runs (upsert)"
     on public.runs for update
     to anon
-    using (true)
-    with check (true);
+    using (approved = false)
+    with check (approved = false);
 
 create policy "anon can insert run_results"
     on public.run_results for insert
@@ -109,3 +122,11 @@ create policy "anon can update custom models (upsert)"
     to anon
     using (true)
     with check (true);
+-- Supabase's newer secret-key role needs explicit table grants - unlike
+-- the legacy service_role JWT, it doesn't get full table access for free.
+-- Run this once (safe to re-run) if push_bundled_results_to_supabase.py or
+-- approve_runs.py fail with a 42501 permission error.
+grant select, insert, update, delete on public.runs to service_role;
+grant select, insert, update, delete on public.run_results to service_role;
+grant select, insert, update, delete on public.custom_models to service_role;
+grant usage, select on all sequences in schema public to service_role;
