@@ -10,8 +10,9 @@ from PySide6.QtWidgets import (
 from app.gui.widgets import card, h2, body, SectionHeader, centered_column
 
 # TODO: replace with the real PRISM website once it's live.
-PRISM_WEBSITE_URL = "https://prism-project.example.com"
-PRISM_DOCS_URL = "https://prism-project.example.com/docs"
+PRISM_WEBSITE_URL = "https://prism-theta-mocha.vercel.app/"
+PRISM_DOCS_URL = "https://prism-theta-mocha.vercel.app/docs"
+PRISM_GITHUB_URL = "https://github.com/Nabin-16/Reliability-test-result-model-versions"
 
 
 class SettingsScreen(QWidget):
@@ -24,9 +25,6 @@ class SettingsScreen(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Same centred, width-capped, scrollable composition as the
-        # Startup and Benchmark screens, so Settings reads as part of the
-        # same app instead of stretching its cards full-bleed edge to edge.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -130,6 +128,31 @@ class SettingsScreen(QWidget):
         ))
         bl.addWidget(what_card)
         root.addWidget(about)
+
+        # ------------------------------------------------------------
+        # Open Source / GitHub section
+        # ------------------------------------------------------------
+        source = card("Card")
+        sl = QVBoxLayout(source)
+        sl.setContentsMargins(24, 22, 24, 22)
+        sl.setSpacing(10)
+        sl.addWidget(h2("Open Source"))
+        sl.addWidget(body(
+            "Check out the available models on github."
+        ))
+
+        source_row = QHBoxLayout()
+        self.github_btn = QPushButton("View on GitHub")
+        self.github_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.github_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(PRISM_GITHUB_URL))
+        )
+        source_row.addWidget(self.github_btn)
+        source_row.addStretch(1)
+        sl.addLayout(source_row)
+    
+
+        root.addWidget(source)
 
         root.addStretch(1)
 

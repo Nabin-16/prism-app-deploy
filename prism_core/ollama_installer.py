@@ -593,16 +593,122 @@ def _server_has_no_cloud_env(port: int = 11434) -> Optional[bool]:
     return None
 
 
+def _linux_systemd_ollama_active() -> bool:
+    """True if ``ollama.service`` (system-level or --user) is currently
+    active via systemd. On Ubuntu, the official install script sets this
+    up by default with ``Restart=always`` (or similar) - which silently
+    respawns ``ollama serve`` any time it's killed, *without* whatever
+    environment (like OLLAMA_NO_CLOUD) the app tried to launch it with.
+    Killing the PID directly (see _kill_stale_server_on_port) looks like
+    it worked, but systemd just brings the same misconfigured server back
+    within moments - this is the Linux equivalent of the Windows tray
+    app respawn problem (ollama/ollama#14761), just via a different
+    supervisor.
+    """
+    for args in (["systemctl", "is-active", "--quiet", "ollama"],
+                 ["systemctl", "--user", "is-active", "--quiet", "ollama"]):
+        try:
+            if subprocess.run(args, capture_output=True, timeout=5).returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _stop_linux_systemd_ollama_noninteractive() -> bool:
+    """Best-effort, silent stop+disable of the systemd unit using only
+    passwordless sudo (``sudo -n``) - never prompts, since this is used
+    from stop() during app shutdown where there's no GUI to ask. Safe to
+    call even if the unit isn't active or passwordless sudo isn't
+    configured; just does nothing and returns False in that case."""
+    ok = False
+    for args in (
+        ["sudo", "-n", "systemctl", "disable", "--now", "ollama"],
+        ["systemctl", "--user", "disable", "--now", "ollama"],
+    ):
+        try:
+            if subprocess.run(args, capture_output=True, timeout=5).returncode == 0:
+                ok = True
+        except Exception:
+            continue
+    return ok
+
+
+def _stop_linux_systemd_ollama_with_password(
+    sudo_password_provider: "SudoPasswordProvider",
+) -> bool:
+    """Stop+disable the systemd unit using a GUI-supplied sudo password,
+    via the same disposable SUDO_ASKPASS helper pattern _install_linux
+    uses - so this never touches a terminal. Used from ensure_ollama()'s
+    repair path, where a password prompt is possible."""
+    if sudo_password_provider is None:
+        return False
+    password = sudo_password_provider()
+    if not password:
+        return False
+    askpass_dir = tempfile.mkdtemp(prefix="prism_ollama_stop_")
+    try:
+        askpass_path = Path(askpass_dir) / "askpass.sh"
+        askpass_path.write_text(f"#!/bin/sh\necho {shlex.quote(password)}\n")
+        askpass_path.chmod(0o700)
+        password = None
+        env = os.environ.copy()
+        env["SUDO_ASKPASS"] = str(askpass_path)
+        try:
+            result = subprocess.run(
+                ["sudo", "-A", "systemctl", "disable", "--now", "ollama"],
+                capture_output=True, timeout=15, env=env,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+    finally:
+        shutil.rmtree(askpass_dir, ignore_errors=True)
+
+
 def _kill_stale_server_on_port(port: int = 11434) -> bool:
     """Best-effort: find whatever process is bound to Ollama's port and
     kill it. Used when we're about to (re)start Ollama but something is
     already squatting on the port without actually serving requests
     properly (a wedged/zombie ``ollama serve`` - it can still answer
     ``/api/tags`` while pulls or generates hang forever). Returns True if
-    something was found and killed."""
+    something was found and killed.
+
+    Windows: previously always returned False here without even trying,
+    which meant ensure_ollama()'s auto-repair (restart a running-but-
+    missing-OLLAMA_NO_CLOUD server) was a silent no-op on Windows - it
+    would report "Ollama is already running" and leave the broken
+    instance in place, so a pull stuck on "pulling manifest" could never
+    self-heal via Start Ollama. Also kills `ollama app.exe` (the tray
+    supervisor) first, not just `ollama.exe` (the server) - Ollama's
+    Windows tray app silently respawns the server on its own if only the
+    server process is killed (confirmed upstream, ollama/ollama#14761),
+    which was undoing this fix within moments of it running.
+    """
     system = platform.system()
     if system == "Windows":
-        return False
+        killed_anything = False
+        try:
+            r1 = subprocess.run(
+                ["taskkill", "/IM", "ollama app.exe", "/F", "/T"],
+                capture_output=True, timeout=5,
+            )
+            if r1.returncode == 0:
+                killed_anything = True
+        except Exception:
+            pass
+        try:
+            r2 = subprocess.run(
+                ["taskkill", "/IM", "ollama.exe", "/F", "/T"],
+                capture_output=True, timeout=5,
+            )
+            if r2.returncode == 0:
+                killed_anything = True
+        except Exception:
+            pass
+        if killed_anything:
+            time.sleep(1.0)
+        return killed_anything
     pids = _running_server_pids(port)
     if not pids:
         return False
@@ -727,6 +833,88 @@ def start(cb: ProgressCB = None) -> None:
     )
 
 
+def stop() -> bool:
+    """Best-effort stop of any locally running Ollama server, so the app
+    never leaves one running in the background after it closes (and never
+    hands the next launch a leftover process that may be missing
+    OLLAMA_NO_CLOUD - see _serve_env). Returns True if something was found
+    and asked to stop.
+
+    Deliberately best-effort and silent on failure: this typically runs
+    during app shutdown, where raising would just produce a confusing
+    error on the way out rather than anything the person could act on.
+    """
+    system = platform.system()
+    stopped = False
+
+    if system == "Windows":
+        # Ollama's Windows tray app (`ollama app.exe`, note the space in the
+        # process name) supervises the server and silently respawns
+        # `ollama.exe serve` if it's killed on its own - confirmed upstream
+        # (ollama/ollama#14761). Killing only ollama.exe looked like it
+        # worked but the respawned process came back with the same
+        # missing OLLAMA_NO_CLOUD, undoing the fix within moments. Kill the
+        # supervisor first so nothing relaunches the server out from under
+        # us, then clean up the server process itself.
+        try:
+            r1 = subprocess.run(
+                ["taskkill", "/IM", "ollama app.exe", "/F", "/T"],
+                capture_output=True, timeout=5,
+            )
+            if r1.returncode == 0:
+                stopped = True
+        except Exception:
+            pass
+        try:
+            r2 = subprocess.run(
+                ["taskkill", "/IM", "ollama.exe", "/F", "/T"],
+                capture_output=True, timeout=5,
+            )
+            if r2.returncode == 0:
+                stopped = True
+        except Exception:
+            pass
+        return stopped
+
+    if system == "Darwin":
+        # Covers both the CLI `ollama serve` process and the menu-bar app
+        # bundle (started via `open -a Ollama` in start() above) - only
+        # one of the two will actually be running, so try both.
+        try:
+            subprocess.run(["pkill", "-x", "ollama"], capture_output=True, timeout=5)
+            stopped = True
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["osascript", "-e", 'quit app "Ollama"'],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+        return stopped
+
+    # Linux
+    stopped = False
+    # If the official Ubuntu install set this up as a systemd service, a
+    # bare process kill isn't enough - systemd will just respawn it
+    # (typically with Restart=always), silently undoing the stop. Try a
+    # passwordless-sudo disable first (this is app shutdown, so no GUI is
+    # available to ask for a password); falls through to a plain PID kill
+    # either way, since that's still needed if it's a plain `ollama serve`
+    # with no systemd unit at all.
+    if _linux_systemd_ollama_active():
+        stopped = _stop_linux_systemd_ollama_noninteractive() or stopped
+    pids = _running_server_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError, ValueError):
+            continue
+        stopped = True
+    return stopped
+
+
 # --------------------------------------------------------------------------
 # One-shot orchestration used by the GUI's "Install Ollama" button
 # --------------------------------------------------------------------------
@@ -756,7 +944,26 @@ def ensure_ollama(cb: ProgressCB = None, sudo_password_provider: SudoPasswordPro
         # in place. If we can't tell (non-Linux, or the check itself
         # fails), leave it alone rather than restarting a server that may
         # be fine.
-        if _server_has_no_cloud_env() is not True:  
+        if _server_has_no_cloud_env() is not True:
+            # On Ubuntu (and other systemd distros), the official install
+            # sets this up as a systemd service that auto-restarts itself
+            # if just killed - so _kill_stale_server_on_port()'s plain PID
+            # kill would appear to work but the service manager brings the
+            # same misconfigured server straight back, and the pull would
+            # go right back to hanging. Disable the unit first (needs
+            # sudo - try silently, then ask via the GUI if that fails) so
+            # the kill+restart below actually sticks.
+            if _linux_systemd_ollama_active():
+                _emit(cb, "starting", "Stopping the Ollama background service\u2026")
+                if not _stop_linux_systemd_ollama_noninteractive():
+                    if not _stop_linux_systemd_ollama_with_password(sudo_password_provider):
+                        raise InstallerError(
+                            "Ollama is running as a systemd service, and stopping "
+                            "it needs administrator (sudo) access that wasn't "
+                            "available here. Run "
+                            "'sudo systemctl disable --now ollama' in a terminal, "
+                            "then click Refresh Status."
+                        )
             _emit(cb, "starting", "Restarting Ollama with cloud pulls disabled\u2026")
             if _kill_stale_server_on_port():
                 start(cb)

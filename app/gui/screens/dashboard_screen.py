@@ -851,8 +851,19 @@ class DashboardScreen(QWidget):
     # ------------------------------------------------- external hooks
     def set_active_model(self, model_tag: str) -> None:
         """Called by MainWindow when the active model changes elsewhere in
-        the app (e.g. after a benchmark run finishes) so the dashboard's
-        primary filter follows it."""
+        the app (e.g. a different model chosen on the startup screen, or
+        after a benchmark run finishes) so the dashboard's primary filter
+        follows it.
+
+        Reloads data first: this can be called before the dashboard has
+        ever been shown (e.g. right after picking a model on the startup
+        screen, well before the person has visited the Dashboard tab), in
+        which case the "Model:" combo may still only hold whatever it was
+        built with initially and won't yet have ``model_tag`` as an option
+        at all - so the requested model would silently fail to apply here
+        and the dashboard would keep showing its previous/default
+        selection instead of the model the person just picked."""
+        self.reload_data()
         idx = self._model_combo.findText(model_tag)
         if idx >= 0:
             self._model_combo.setCurrentIndex(idx)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -30,6 +31,19 @@ GITHUB_RAW_BASE = (
 CACHE_DIR = Path.home() / ".prism" / "cache"
 INDEX_CACHE_FILE = CACHE_DIR / "public_index.json"
 REQUEST_TIMEOUT = 5
+
+# In-process memoization of the public index. Without this, every call to
+# has_published_result() (in turn called once per ModelRow built on the
+# startup screen - one per catalog model, plus again in main_window.py and
+# run_screen.py) did its own blocking `requests.get` to GitHub. Building N
+# model rows meant N sequential blocking network round-trips on the GUI
+# thread just to draw the launch screen - the on-disk cache only ever
+# helped after a network failure, never on the (common) success path. This
+# cache makes only the *first* call in a process do real network I/O; every
+# later call within the TTL is instant and in-memory.
+_INDEX_MEMO: list[dict[str, Any]] | None = None
+_INDEX_MEMO_AT: float = 0.0
+_INDEX_MEMO_TTL_SECONDS = 300.0
 
 
 def safe_model_filename(model_name: str) -> str:
@@ -49,8 +63,22 @@ def normalize_model_tag(tag: str) -> str:
 def fetch_public_index(force_refresh: bool = False) -> list[dict[str, Any]]:
     """Fetch the index catalog of published model results from GitHub.
 
-    Returns the cached copy if network fails or if offline.
+    Memoized in-process for _INDEX_MEMO_TTL_SECONDS so repeated calls in the
+    same run (e.g. one per model row on the startup screen) reuse the first
+    result instead of each doing their own blocking network round-trip.
+    Falls back to the on-disk cache, then to an empty list, if the network
+    call fails.
     """
+    global _INDEX_MEMO, _INDEX_MEMO_AT
+
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _INDEX_MEMO is not None
+        and (now - _INDEX_MEMO_AT) < _INDEX_MEMO_TTL_SECONDS
+    ):
+        return _INDEX_MEMO
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     if not force_refresh and INDEX_CACHE_FILE.exists():
@@ -66,6 +94,7 @@ def fetch_public_index(force_refresh: bool = False) -> list[dict[str, Any]]:
             data = resp.json()
             if isinstance(data, list):
                 INDEX_CACHE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                _INDEX_MEMO, _INDEX_MEMO_AT = data, now
                 return data
     except Exception:
         pass
@@ -73,7 +102,9 @@ def fetch_public_index(force_refresh: bool = False) -> list[dict[str, Any]]:
     # Offline / network failure fallback
     if INDEX_CACHE_FILE.exists():
         try:
-            return json.loads(INDEX_CACHE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(INDEX_CACHE_FILE.read_text(encoding="utf-8"))
+            _INDEX_MEMO, _INDEX_MEMO_AT = data, now
+            return data
         except Exception:
             return []
     return []

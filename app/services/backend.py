@@ -109,6 +109,18 @@ def ollama_installed_on_device() -> bool:
     return ollama_installer.is_installed()
 
 
+def ollama_stop() -> bool:
+    """Best-effort stop of any locally running Ollama server. Called on
+    app shutdown so the app never leaves a background process running,
+    and the next launch always starts clean via the app's own Start
+    Ollama step rather than silently reusing whatever's left over."""
+    from prism_core import ollama_installer
+    try:
+        return ollama_installer.stop()
+    except Exception:
+        return False
+
+
 def ollama_auto_install_supported() -> bool:
     from prism_core import ollama_installer
     return ollama_installer.is_platform_supported()
@@ -468,6 +480,52 @@ class OllamaInstallWorker(QThread):
             self.finished_ok.emit(False, str(exc))
         except Exception as exc:  # noqa: BLE001 - never let an install crash the GUI thread
             self.finished_ok.emit(False, f"Unexpected error installing Ollama: {exc}")
+
+
+class OllamaCheckWorker(QThread):
+    """Background version of the startup screen's Ollama reachability check.
+
+    Does the same blocking work ``StartupScreen._check_ollama`` used to do
+    inline: ``ollama_available()`` (HTTP, up to a 5s timeout) and, if
+    reachable, ``ollama_ensure_no_cloud_env()`` - which can kill and restart
+    the Ollama process - followed by a re-check. Left on the GUI thread,
+    that combination can freeze the window for several seconds right at
+    launch and on every "Refresh" click. Runs on a QThread instead and
+    reports only the final boolean; all the status-text/button UI logic
+    stays in the screen itself, driven off this result.
+    """
+
+    checked = Signal(bool)
+
+    def run(self) -> None:
+        try:
+            reachable = ollama_available()
+            if reachable and ollama_ensure_no_cloud_env():
+                reachable = ollama_available()
+        except Exception:
+            reachable = False
+        self.checked.emit(reachable)
+
+
+class OllamaStatusWorker(QThread):
+    """Checks Ollama reachability off the GUI thread.
+
+    ``ollama_available()`` does a blocking HTTP request (up to a 5s timeout
+    when Ollama is unreachable). Running that on a QTimer tick on the main
+    thread freezes the whole UI for up to 5s every poll whenever Ollama is
+    offline or slow to respond - noticeable stutter, worse on low-RAM
+    machines where Ollama itself is slower to answer. This worker does the
+    same check on a background thread and reports the result via signal.
+    """
+
+    status_checked = Signal(bool)
+
+    def run(self) -> None:
+        try:
+            available = ollama_available()
+        except Exception:
+            available = False
+        self.status_checked.emit(available)
 
 
 class SyncWorker(QThread):

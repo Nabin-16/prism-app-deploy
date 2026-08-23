@@ -227,9 +227,20 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """Warn before closing if something's actively in-flight that would
         be silently killed - a running benchmark, an Ollama install, or a
-        model pull - rather than letting the window vanish mid-task."""
+        model pull - rather than letting the window vanish mid-task.
+
+        Either way the window actually closes, stop the local Ollama
+        server first (see backend.ollama_stop) - the app owns Ollama's
+        lifecycle: it starts it, so it also stops it, rather than leaving
+        it running in the background after the app is gone. This also
+        guarantees the next launch never inherits a leftover process that
+        might be missing OLLAMA_NO_CLOUD (see
+        ollama_installer._serve_env), which is what causes pulls to hang
+        forever on "pulling manifest".
+        """
         reasons = self._in_progress_reasons()
         if not reasons:
+            backend.ollama_stop()
             super().closeEvent(event)
             return
 
@@ -255,6 +266,7 @@ class MainWindow(QMainWindow):
             # app, which is what made a *second* launch's pull of the same
             # model appear to refuse to start or progress.
             self._cancel_in_progress_work()
+            backend.ollama_stop()
             super().closeEvent(event)
         else:
             event.ignore()
@@ -364,6 +376,7 @@ class MainWindow(QMainWindow):
             return
         self._show_app_chrome()
         self.active_model = model_tag
+        app_state.set_selected_model(model_tag)
         self.model_badge.set_model(backend.model_label(model_tag))
         self.dashboard_screen.set_model(model_tag)
         self.run_screen.preselect_model(model_tag)
@@ -412,7 +425,8 @@ class MainWindow(QMainWindow):
         self.outer_stack.fade_to(self.app_shell)
         self._show_tab("dashboard")
 
-    def _on_skip_to_dashboard(self) -> None:        # Belt-and-suspenders: the skip link itself is only shown when
+    def _on_skip_to_dashboard(self, picked_tag: str = "") -> None:
+        # Belt-and-suspenders: the skip link itself is only shown when
         # Ollama is connected (see StartupScreen._refresh_skip_link_visibility),
         # but never trust a signal alone to gate navigation - re-check here
         # too, since this is the one place that can move the user off the
@@ -427,10 +441,20 @@ class MainWindow(QMainWindow):
             return
         self._show_app_chrome()
         conn = backend.get_conn()
-        model_tag = app_state.get_selected_model()
-        if not model_tag or not backend.has_data(conn, model_tag):
-            data = backend.models_with_data(conn)
-            model_tag = next(iter(data), None)
+        # ``picked_tag`` is whichever model row was highlighted in the
+        # picker at the moment "Skip to dashboard" was clicked (e.g. the
+        # person selected an installed model but never pressed Continue) -
+        # honor that choice first, as long as it's actually installed and
+        # has data. Only fall back to the remembered/first-available model
+        # when nothing was actively selected, or that selection has no
+        # data to show.
+        if picked_tag and backend.is_installed(picked_tag) and backend.has_data(conn, picked_tag):
+            model_tag = picked_tag
+        else:
+            model_tag = app_state.get_selected_model()
+            if not model_tag or not backend.has_data(conn, model_tag):
+                data = backend.models_with_data(conn)
+                model_tag = next(iter(data), None)
         if model_tag:
             self.active_model = model_tag
             app_state.set_selected_model(model_tag)
@@ -514,7 +538,19 @@ class MainWindow(QMainWindow):
         self._show_tab("benchmark")
 
     def _refresh_ollama_status(self) -> None:
-        if backend.ollama_available():
+        # Runs the (potentially blocking, up to ~5s) reachability check on a
+        # worker thread so a slow/offline Ollama never freezes the GUI.
+        # Guard against overlap: if a previous check is still running (e.g.
+        # Ollama is timing out), skip this tick rather than piling up threads.
+        if getattr(self, "_ollama_status_worker", None) is not None and self._ollama_status_worker.isRunning():
+            return
+        worker = backend.OllamaStatusWorker(self)
+        worker.status_checked.connect(self._on_ollama_status_checked)
+        self._ollama_status_worker = worker
+        worker.start()
+
+    def _on_ollama_status_checked(self, available: bool) -> None:
+        if available:
             self.ollama_status_lbl.setText("\u25cf Ollama online")
         else:
             self.ollama_status_lbl.setText("\u25cb Ollama offline")

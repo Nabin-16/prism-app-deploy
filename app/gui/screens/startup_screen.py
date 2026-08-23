@@ -152,7 +152,11 @@ class StartupScreen(QWidget):
     """
 
     model_chosen = Signal(str)
-    skip_to_dashboard = Signal()
+    # Carries whichever model row is currently highlighted in the picker
+    # (may be "" if none is) - so that skipping straight to the Dashboard
+    # while a specific installed model is selected lands on that model's
+    # data, not on whatever was last remembered/used.
+    skip_to_dashboard = Signal(str)
     # Emitted when the person picks "View existing data" for a searched
     # model tag that already has verified/published results on GitHub -
     # the model is deliberately NOT pulled/installed for this path (see
@@ -169,10 +173,19 @@ class StartupScreen(QWidget):
         # that a *successful* pull automatically advances into the app
         # instead of leaving the user stranded on this screen.
         self._auto_continue_tag: str | None = None
+        # The app now stops Ollama on close (see MainWindow.closeEvent /
+        # backend.ollama_stop), so it should be the one that starts it
+        # again too, on an explicit click - never silently auto-connect
+        # just because *something* answered on the port at launch (e.g.
+        # the person started it manually, or the previous stop failed).
+        # Only the very first check of a session is held to this; a
+        # Refresh click afterward behaves normally.
+        self._launch_check_pending = True
         self.setObjectName("StartupRoot")
         self._existing_results = False
         self._connected = False
         self._install_worker = None  # backend.OllamaInstallWorker | None
+        self._ollama_check_worker = None  # backend.OllamaCheckWorker | None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -341,7 +354,12 @@ class StartupScreen(QWidget):
         self.skip_link.setFlat(True)
         self.skip_link.setVisible(False)
         inner.addWidget(self.skip_link, 0, Qt.AlignmentFlag.AlignHCenter)
-        self.skip_link.clicked.connect(self.skip_to_dashboard.emit)
+        # NOTE: connect to a real slot, not directly to skip_to_dashboard.emit.
+        # QPushButton.clicked emits a bool ("checked"); binding that straight
+        # to emit() would pass that bool as the signal's str argument instead
+        # of the selected model tag (same pitfall as HomeScreen's Get
+        # Started button - see its comment for details).
+        self.skip_link.clicked.connect(self._on_skip_clicked)
 
         inner.addStretch(1)
 
@@ -361,6 +379,14 @@ class StartupScreen(QWidget):
         # slip past this gate.
         self.skip_link.setVisible(self._existing_results and self._connected)
 
+    def _on_skip_clicked(self, checked: bool = False) -> None:
+        # Pass along whichever model is currently highlighted in the
+        # picker (e.g. an installed model the person just selected but
+        # hasn't pressed Continue for yet), so MainWindow can send them
+        # straight to that model's Dashboard instead of falling back to
+        # a remembered/first-available model.
+        self.skip_to_dashboard.emit(self.selected_model_tag or "")
+
     def _check_ollama(self) -> None:
         self.status_dot.setObjectName("StatusDotPending")
         self._refresh_dot_style()
@@ -368,22 +394,46 @@ class StartupScreen(QWidget):
         self.status_pill.setStyleSheet("background: rgba(156,153,168,0.15); color:#9c99a8;")
         self.status_detail.setText("Checking localhost:11434 for a running Ollama instance\u2026")
 
-        reachable = backend.ollama_available()
-        if reachable:
-            # Ollama answering /api/tags only means *something* is up on
-            # the port - if it's a plain `ollama serve` missing
-            # OLLAMA_NO_CLOUD=1 (started manually, or left running from a
-            # previous session), pulls will hang forever on "pulling
-            # manifest" on networks that can't reach Ollama's cloud
-            # endpoint. The button-driven install/start path already
-            # detects and fixes this, but that path never runs when
-            # Ollama was already reachable at launch - check and restart
-            # here too so "CONNECTED" always actually means pulls will
-            # work. Best-effort/self-healing: if a restart happens, give
-            # the freshly-restarted server a moment to come back up
-            # before trusting reachable/CONNECTED below.
-            if backend.ollama_ensure_no_cloud_env():
-                reachable = backend.ollama_available()
+        # The actual reachability check (an HTTP call, plus a possible
+        # process kill/restart if Ollama is up without OLLAMA_NO_CLOUD) is
+        # done off the GUI thread - see backend.OllamaCheckWorker. Left
+        # inline this used to freeze the window for several seconds on
+        # every launch and every Refresh click. Guard against a second
+        # check starting while one is already in flight (e.g. rapid
+        # Refresh clicks).
+        if self._ollama_check_worker is not None and self._ollama_check_worker.isRunning():
+            return
+        worker = backend.OllamaCheckWorker(self)
+        worker.checked.connect(self._on_ollama_checked)
+        self._ollama_check_worker = worker
+        worker.start()
+
+    def _on_ollama_checked(self, reachable: bool) -> None:
+        is_launch_check = self._launch_check_pending
+        self._launch_check_pending = False
+        if is_launch_check and reachable:
+            # Something is answering on the port right at launch, but
+            # don't auto-connect to it - require the explicit Start Ollama
+            # click every session (see the note in __init__). Present this
+            # exactly like the "installed but not running" state so the
+            # person just clicks the same button either way.
+            self._connected = False
+            self._refresh_skip_link_visibility()
+            self.status_dot.setObjectName("StatusDotBad")
+            self._refresh_dot_style()
+            self.status_pill.setText("NOT CONNECTED")
+            self.status_pill.setStyleSheet("background: rgba(234,107,107,0.15); color:#ea6b6b;")
+            self.status_detail.setText(
+                "Click Start Ollama to begin this session."
+            )
+            for tag, row in self.model_rows.items():
+                if tag not in self.pull_workers:
+                    row.action_btn.setEnabled(False)
+            self.install_btn.setText("Start Ollama")
+            self.install_btn.setVisible(True)
+            self._refresh_model_rows()
+            self._update_continue_btn()
+            return
         if reachable:
             self._connected = True
             self.status_dot.setObjectName("StatusDotGood")
@@ -409,10 +459,20 @@ class StartupScreen(QWidget):
             self._refresh_skip_link_visibility()
             self.status_dot.setObjectName("StatusDotBad")
             self._refresh_dot_style()
-            self.status_pill.setText("NOT FOUND")
-            self.status_pill.setStyleSheet("background: rgba(234,107,107,0.15); color:#ea6b6b;")
 
             already_installed = backend.ollama_installed_on_device()
+            # The pill previously always said "NOT FOUND" here, even when
+            # Ollama IS installed on this device and just isn't running -
+            # confusing, since the detail text right below already draws
+            # that distinction correctly. Match the pill to it: "installed
+            # but not running" reads very differently from "not present on
+            # this device at all".
+            if already_installed:
+                self.status_pill.setText("NOT RUNNING")
+            else:
+                self.status_pill.setText("NOT FOUND")
+            self.status_pill.setStyleSheet("background: rgba(234,107,107,0.15); color:#ea6b6b;")
+
             for tag, row in self.model_rows.items():
                 if tag not in self.pull_workers:
                     row.action_btn.setEnabled(False)
