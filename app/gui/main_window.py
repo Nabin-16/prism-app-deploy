@@ -18,9 +18,23 @@ from app.gui.screens.settings_screen import SettingsScreen
 from app.gui.screens.home_screen import HomeScreen
 from app.services import backend, app_state, supabase_sync, public_results
 
-RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
-LOGO_ICON_PATH = RESOURCES_DIR / "prism_logo.png"      # mark only, used as window/app icon
+import platform as _platform
+import sys as _sys
+
+# Resolve the resources directory for both source-checkout and PyInstaller
+# frozen builds (where assets are unpacked under sys._MEIPASS).
+if getattr(_sys, "frozen", False) and hasattr(_sys, "_MEIPASS"):
+    RESOURCES_DIR = Path(_sys._MEIPASS) / "app" / "resources"  # type: ignore[attr-defined]
+else:
+    RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
+
+# Prefer .ico on Windows (native taskbar/titlebar format); fall back to .png.
+if _platform.system() == "Windows" and (RESOURCES_DIR / "prism_logo.ico").exists():
+    LOGO_ICON_PATH = RESOURCES_DIR / "prism_logo.ico"
+else:
+    LOGO_ICON_PATH = RESOURCES_DIR / "prism_logo.png"      # mark only, used as window/app icon
 LOGO_WORDMARK_PATH = RESOURCES_DIR / "prism_text.png"  # mark + "PRISM" wordmark, used in the toolbar
+
 
 
 class MainWindow(QMainWindow):

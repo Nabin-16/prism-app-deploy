@@ -445,13 +445,18 @@ class DashboardScreen(QWidget):
         return self._apply_common_filters(self._pr_rows)
 
     def _update_views(self) -> None:
-        ds_filtered = self._filtered_ds_rows()
-        pr_filtered = self._filtered_pr_rows()
+        self.setUpdatesEnabled(False)
+        try:
+            ds_filtered = self._filtered_ds_rows()
+            pr_filtered = self._filtered_pr_rows()
 
-        self._update_kpi_cards(ds_filtered)
-        if HAS_CHARTS:
-            self._update_charts(ds_filtered, pr_filtered)
-        self._update_table(ds_filtered)
+            self._update_kpi_cards(ds_filtered)
+            if HAS_CHARTS:
+                self._update_charts(ds_filtered, pr_filtered)
+            self._update_table(ds_filtered)
+        finally:
+            self.setUpdatesEnabled(True)
+
 
     def _update_kpi_cards(self, rows: list[dict[str, Any]]) -> None:
         if not rows:

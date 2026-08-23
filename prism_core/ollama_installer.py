@@ -170,9 +170,13 @@ def detect() -> DetectResult:
 
 def _run(cmd: list[str], *, timeout: float, cwd: Optional[str] = None) -> subprocess.CompletedProcess:
     try:
+        kwargs: dict = {}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
         return subprocess.run(
             cmd, cwd=cwd, timeout=timeout,
             capture_output=True, text=True,
+            **kwargs,
         )
     except FileNotFoundError as exc:
         raise InstallerError(f"Couldn't run {cmd[0]!r} - it isn't on this device.", str(exc)) from exc
@@ -489,6 +493,28 @@ def _install_macos(cb: ProgressCB, sudo_password_provider: SudoPasswordProvider 
             )
 
 
+
+def _kill_ollama_tray_app() -> None:
+    """Kill the Ollama Desktop tray application on Windows if it was
+    auto-launched by the installer. The tray app opens a browser tab asking
+    the user to sign into ollama.com — which is never needed for local
+    inference. Killing it lets the app start ``ollama serve`` headlessly
+    instead. Best-effort and silent on failure."""
+    if platform.system() != "Windows":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/IM", "ollama app.exe", "/F", "/T"],
+            capture_output=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+        )
+    except Exception:
+        pass
+    # Give the process tree a moment to fully exit before we try to start
+    # ``ollama serve`` ourselves.
+    time.sleep(0.5)
+
+
 def _install_windows(cb: ProgressCB, sudo_password_provider: SudoPasswordProvider = None) -> None:
     winget = shutil.which("winget")
     if winget:
@@ -500,6 +526,7 @@ def _install_windows(cb: ProgressCB, sudo_password_provider: SudoPasswordProvide
             timeout=INSTALL_SUBPROCESS_TIMEOUT_S,
         )
         if result.returncode == 0:
+            _kill_ollama_tray_app()
             return
         # Fall through to the direct installer if winget itself failed
         # (e.g. no matching source configured) rather than giving up.
@@ -515,6 +542,11 @@ def _install_windows(cb: ProgressCB, sudo_password_provider: SudoPasswordProvide
                 "manually from https://ollama.com/download.",
                 result.stderr[-2000:],
             )
+    # The installer (and winget) may auto-launch the Ollama tray app, which
+    # opens a sign-in prompt in the default browser. Kill it immediately so
+    # the app can start `ollama serve` headlessly instead — local inference
+    # never needs an Ollama account.
+    _kill_ollama_tray_app()
 
 
 _INSTALLERS = {"Linux": _install_linux, "Darwin": _install_macos, "Windows": _install_windows}
@@ -692,6 +724,7 @@ def _kill_stale_server_on_port(port: int = 11434) -> bool:
             r1 = subprocess.run(
                 ["taskkill", "/IM", "ollama app.exe", "/F", "/T"],
                 capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
             )
             if r1.returncode == 0:
                 killed_anything = True
@@ -701,6 +734,7 @@ def _kill_stale_server_on_port(port: int = 11434) -> bool:
             r2 = subprocess.run(
                 ["taskkill", "/IM", "ollama.exe", "/F", "/T"],
                 capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
             )
             if r2.returncode == 0:
                 killed_anything = True
@@ -860,6 +894,7 @@ def stop() -> bool:
             r1 = subprocess.run(
                 ["taskkill", "/IM", "ollama app.exe", "/F", "/T"],
                 capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
             )
             if r1.returncode == 0:
                 stopped = True
@@ -869,6 +904,7 @@ def stop() -> bool:
             r2 = subprocess.run(
                 ["taskkill", "/IM", "ollama.exe", "/F", "/T"],
                 capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
             )
             if r2.returncode == 0:
                 stopped = True

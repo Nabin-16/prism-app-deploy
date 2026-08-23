@@ -76,8 +76,14 @@ _TEXT_FAINT = colors.HexColor("#6b6878")
 _HAIRLINE = colors.HexColor("#dcd8ea")
 _ROW_ALT = colors.HexColor("#f5f3fb")
 
-_LOGO_PATH = Path(__file__).resolve().parent.parent / "resources" / "prism_logo.png"
+import sys as _sys
+
+if getattr(_sys, "frozen", False) and hasattr(_sys, "_MEIPASS"):
+    _LOGO_PATH = Path(_sys._MEIPASS) / "app" / "resources" / "prism_logo.png"  # type: ignore[attr-defined]
+else:
+    _LOGO_PATH = Path(__file__).resolve().parent.parent / "resources" / "prism_logo.png"
 _PAGE_MARGIN = 0.7 * inch
+
 
 
 def _f(value: Any, default: float = 0.0) -> float:

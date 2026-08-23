@@ -272,9 +272,10 @@ class FadeStackedWidget(QStackedWidget):
     never reach into widget A's still-in-flight animation.
     """
 
-    def __init__(self, parent: QWidget | None = None, *, duration: int = 220) -> None:
+    def __init__(self, parent: QWidget | None = None, *, duration: int = 120) -> None:
         super().__init__(parent)
         self._duration = duration
+
 
     def fade_to(self, widget: QWidget, *, duration: int | None = None) -> None:
         """Switch to *widget*, fading it in. No-op if it's already current."""

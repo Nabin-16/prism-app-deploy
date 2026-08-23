@@ -11,8 +11,17 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
-RESOURCES_DIR = Path(__file__).resolve().parents[2] / "resources"
+import platform as _platform
+import sys as _sys
+
+# Resolve the resources directory for both source-checkout and PyInstaller
+# frozen builds (where assets are unpacked under sys._MEIPASS).
+if getattr(_sys, "frozen", False) and hasattr(_sys, "_MEIPASS"):
+    RESOURCES_DIR = Path(_sys._MEIPASS) / "app" / "resources"  # type: ignore[attr-defined]
+else:
+    RESOURCES_DIR = Path(__file__).resolve().parents[2] / "resources"
 LOGO_ICON_PATH = RESOURCES_DIR / "prism_logo.png"
+
 
 
 class HomeScreen(QWidget):

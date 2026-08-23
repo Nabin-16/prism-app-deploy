@@ -33,6 +33,8 @@ htmlcov/
 runs/
 .prism/
 PRISM_*.pdf
+*.db
+prism.db
 
 # IDE & OS
 .idea/

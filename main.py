@@ -27,6 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from PySide6.QtCore import Qt, QCoreApplication
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QIcon
 
@@ -63,14 +64,31 @@ def _install_crash_guard(app: QApplication) -> None:
 
 
 def main() -> None:
+    # Optimize native widget rendering and prevent sibling window handle contention on Windows
+    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings, True)
+
     app = QApplication(sys.argv)
     _install_crash_guard(app)
+
     # Fusion is Qt's own native-feeling cross-platform style (proper focus
     # rects, real system-ish widgets) - a much better base for the QSS in
     # theme.py to sit on top of than whatever the platform default is.
     app.setStyle("Fusion")
     app.setApplicationName("PRISM")
-    icon_path = PROJECT_ROOT / "app" / "resources" / "prism_logo.png"
+
+    # Prefer .ico on Windows (native taskbar/titlebar format) with .png
+    # fallback; handle both source-checkout and PyInstaller-frozen paths.
+    import platform as _platform
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        _res_dir = Path(sys._MEIPASS) / "app" / "resources"  # type: ignore[attr-defined]
+    else:
+        _res_dir = PROJECT_ROOT / "app" / "resources"
+
+    if _platform.system() == "Windows" and (_res_dir / "prism_logo.ico").exists():
+        icon_path = _res_dir / "prism_logo.ico"
+    else:
+        icon_path = _res_dir / "prism_logo.png"
+
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 

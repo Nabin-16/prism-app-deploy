@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
 import shutil
 import sqlite3
 import subprocess
@@ -107,16 +108,20 @@ def _curl_request(
         cmd += ["-H", f"{key}: {value}"]
     if json_body is not None:
         cmd += ["--data-binary", json.dumps(json_body)]
-    cmd.append(url)
+    kwargs: dict[str, Any] = {}
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout + 5,
+            **kwargs,
         )
     except subprocess.TimeoutExpired as exc:
         raise _CurlError(f"curl timed out: {exc}") from exc
     except OSError as exc:
         raise _CurlError(f"could not launch curl: {exc}") from exc
+
 
     if proc.returncode != 0:
         raise _CurlError(f"curl exited {proc.returncode}: {proc.stderr.strip()[:300]}")
