@@ -74,9 +74,9 @@ Can cross-prompt agreement, together with correctness and instruction adherence,
 
 ---
 
-## Experiment 1
+## Experiment
 
-Experiment 1 uses five controlled prompt formulation conditions.
+This experment uses five controlled prompt formulation conditions.
 
 | ID | Condition | Main manipulation |
 |---|---|---|
@@ -111,7 +111,7 @@ This prevents response-format instructions from becoming an unintended experimen
 
 ### Deferred techniques
 
-The following are not part of Experiment 1 (bird):
+The following are not part of Experiment (bird):
 
 - few-shot prompting;
 - chain-of-thought prompting;
@@ -383,7 +383,7 @@ results/summary/model_dataset_summary.csv     # one row per (model, dataset)
 results/summary/model_prompt_summary.csv      # one row per (model, dataset, prompt_condition)
 ```
 
-`model_dataset_summary.csv` includes `prompt_invariant_incorrect_rate` —
+`model_dataset_summary.csv` includes `prompt_invariant_incorrect_rate` 
 the proportion of questions where all five prompt conditions agreed
 unanimously on the same *wrong* answer (see [Important Interpretation](#important-interpretation) below).
 
@@ -451,60 +451,6 @@ The answer is unclear.
 The parser is deliberately conservative and does not use the benchmark answer to infer what the model intended.
 
 ---
-
-## Scoring
-
-### Prompt level correctness
-
-For question \(q\), model \(m\), and prompt condition \(p\):
-
-\[
-Correct(q,m,p)=
-egin{cases}
-1 & 	ext{if parsed answer equals the benchmark answer}\
-0 & 	ext{otherwise}
-\end{cases}
-\]
-
-`UNKNOWN` is not treated as an answer choice.
-
-### Cross-prompt agreement
-
-For a question/model pair, after excluding `UNKNOWN` responses:
-
-\[
-C(q,m)=
-rac{
-\max_{a \in \{A,B,C,D\}} n_a
-}{
-V
-}
-\]
-
-where:
-
-- \(n_a\) = count of valid responses selecting answer \(a\);
-- \(V\) = total number of valid responses.
-
-### Usable response rate
-
-\[
-UR(q,m)=rac{V}{5}
-\]
-
-### Prompt Sensitivity Index
-
-The primary operational measure is:
-
-\[
-PSI(q,m)=1-C(q,m)
-\]
-
-Higher agreement therefore corresponds to lower observed prompt sensitivity.
-
-### Unanimous agreement
-
-A question is unanimous if all five responses are valid and identical.
 
 ### Important Interpretation
 
@@ -596,11 +542,6 @@ Question metrics
 Model-level analysis
 ```
 
-The raw-response layer is treated as immutable evidence.
-
-Derived files may be regenerated without rerunning model inference.
-
----
 
 ## Reproducibility Rules
 
@@ -623,50 +564,6 @@ Any methodological change becomes a new experiment version.
 
 ---
 
-## What Experiment 1 Does Not Claim
-
-Experiment 1 does not claim:
-
-- cross-domain generalization;
-- that agreement guarantees truth;
-- that PRISM automatically improves every SLM;
-- that all benchmark labels are indisputable;
-- that five prompt formulations cover the space of prompting strategies;
-- that an advanced mitigation technique works before a separate experiment demonstrates it.
-
-The first experiment is specifically a study of:
-
-> **prompt formulation sensitivity and behavioral reliability of locally run SLMs on educational multiple-choice questions under deterministic inference.**
-
----
-
-## Future PRISM Application
-
-The research phase is the empirical foundation for the eventual PRISM application.
-
-Conceptually:
-
-```text
-User Query
-    ↓
-Validated Prompt Strategies
-    ↓
-Target SLM
-    ↓
-Response Comparison
-    ↓
-Reliability Assessment
-    ↓
-Evidence-based Mitigation
-    ↓
-Final Response
-```
-
-The application is intended to be a **reliability-aware wrapper around SLM inference**, not a system that claims to make every model universally reliable.
-
-Advanced techniques such as few-shot prompting, critique, self-consistency, or polarity transformation will only be integrated after they are separately evaluated.
-
----
 
 ## Research Principles
 
@@ -687,63 +584,3 @@ Every raw response is stored before parsing and scoring.
 Potential mitigation strategies are tested rather than assumed to improve reliability.
 
 ---
-
-## Current Status
-
-### Implemented
-
-- educational-only scope;
-- ARC-Challenge and SciQ;
-- 200 questions per dataset;
-- fixed seeded sampling;
-- four local SLMs;
-- five prompt formulation conditions;
-- frozen prompt templates;
-- rendered prompt artifacts;
-- deterministic Ollama inference;
-- raw response storage;
-- compact response parser;
-- prompt-level scoring;
-- cross-prompt agreement;
-- prompt sensitivity calculation;
-- benchmark audit preparation;
-- model-level and prompt-condition-level summary aggregation.
-
-### Implementation delta:(bliss)
-
-This revision was produced by reviewing the updated research specification
-
-**Real bugs fixed:**
-
-- `benchmark_audit.py` wrote to `data/processed/` while its own docstring and this README documented `data/audit/`. Fixed to write to `data/audit/`, per spec section 15.
-- `FINAL_PATTERNS` in `response_parser.py` matched `"final answer: B"` but not
-  `"final answer is B"`,  the verb form silently fell through to UNKNOWN. The
-  sibling `EXPLICIT_PATTERNS` group already handled both forms correctly;
-  this was an inconsistency between the two pattern groups, not a design
-  choice. Fixed, and both forms are now covered by
-  `src/test_response_parser.py`.
-- `config.py`, `load_datasets.py`, `prompt_variations.py`, and
-  `benchmark_audit.py` each independently redefined paths and constants
-  (seed, sample size, template version, audit directory) instead of
-  importing them from `config.py`. This risked silent drift if one copy was
-  changed without the others. All four now import from `config.py` as the
-  single source of truth (spec section 19A).
-
-  
-
-### Current stage
-
-**Pipeline validation and benchmark audit.**
-
-The full 8,000-request experiment should begin only after the benchmark audit and experimental configuration are frozen.
-
-### Planned next stages
-
-1. Complete the benchmark audit.
-2. Validate the full experiment runner.
-3. Run the complete 8,000-request experiment.
-4. Analyze correctness, instruction adherence, agreement, and prompt sensitivity.
-5. Characterize meaningful failure patterns.
-6. Design a separate mitigation experiment if justified by the results.
-7. Build the final reliability-aware PRISM application around validated findings.
-
