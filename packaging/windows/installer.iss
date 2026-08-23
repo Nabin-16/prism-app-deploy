@@ -19,6 +19,10 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\PRISM.exe
+; Force close running instances cleanly during upgrades without showing error dialogs
+CloseApplications=force
+CloseApplicationsFilter=PRISM.exe
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -35,3 +39,14 @@ Name: "{autodesktop}\PRISM"; Filename: "{app}\PRISM.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\PRISM.exe"; Description: "Launch PRISM"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// Silently terminate any running PRISM process before files are extracted
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill.exe', '/F /IM PRISM.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := '';
+end;
+
